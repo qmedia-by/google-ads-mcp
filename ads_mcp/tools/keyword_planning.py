@@ -32,9 +32,6 @@ from google.ads.googleads.errors import GoogleAdsException
 from google.ads.googleads.v24.enums.types.keyword_plan_network import (
     KeywordPlanNetworkEnum,
 )
-from google.ads.googleads.v24.services.types.keyword_plan_idea_service import (
-    GenerateKeywordIdeasRequest,
-)
 
 planning_mcp = FastMCP("planning")
 
@@ -88,7 +85,7 @@ def _build_request(
     page_url: str,
     keyword_plan_network: str,
     include_adult_keywords: bool,
-) -> GenerateKeywordIdeasRequest:
+) -> Any:
     """Validates inputs and assembles the API request."""
     if not keywords and not page_url:
         raise ToolError(
@@ -108,7 +105,13 @@ def _build_request(
             f"{', '.join(sorted(_NETWORKS))}, got '{keyword_plan_network}'."
         )
 
-    request = GenerateKeywordIdeasRequest()
+    # Build the request through the same client that later resolves the
+    # service, so both come from one API version. Importing the type from a
+    # pinned version instead lets the two drift apart the moment the client
+    # moves to a newer default, and the service then rejects the request as
+    # "Invalid constructor input" — an error that points at the payload while
+    # the fault is the type.
+    request = utils.get_googleads_type("GenerateKeywordIdeasRequest")
     request.customer_id = customer_id
     request.language = _resource_name(language, "languageConstants")
     request.geo_target_constants.extend(
