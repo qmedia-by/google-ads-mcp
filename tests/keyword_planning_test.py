@@ -26,11 +26,18 @@ from ads_mcp.tools.keyword_planning import (
 
 from google.ads.googleads.v24.services.types.keyword_plan_idea_service import (
     GenerateKeywordIdeaResult,
+    GenerateKeywordIdeasRequest,
 )
 
 
 def build(**overrides):
-    """Builds a request with valid defaults, overriding named arguments."""
+    """Builds a request with valid defaults, overriding named arguments.
+
+    The version the request type is pinned to does not matter here: production
+    takes its type from the live client, and `_build_request` only fills in
+    whatever message it is handed. Supplying one directly is what keeps these
+    tests runnable without credentials.
+    """
     kwargs = {
         "customer_id": "1234567890",
         "language": "1031",
@@ -41,7 +48,7 @@ def build(**overrides):
         "include_adult_keywords": False,
     }
     kwargs.update(overrides)
-    return _build_request(**kwargs)
+    return _build_request(GenerateKeywordIdeasRequest(), **kwargs)
 
 
 class TestResourceName(unittest.TestCase):

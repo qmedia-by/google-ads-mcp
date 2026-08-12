@@ -78,6 +78,7 @@ def _optional(message: Any, field: str) -> Any:
 
 
 def _build_request(
+    request: Any,
     customer_id: str,
     language: str,
     geo_target_constants: List[str],
@@ -86,7 +87,19 @@ def _build_request(
     keyword_plan_network: str,
     include_adult_keywords: bool,
 ) -> Any:
-    """Validates inputs and assembles the API request."""
+    """Validates inputs and fills in the empty API request it is given.
+
+    The request arrives from the caller instead of being constructed here,
+    because it has to carry the same API version as the service that will
+    receive it, and only the caller holds the client that settles that
+    version. Pinning the type to a version in this module lets the two drift
+    apart as soon as the client's default moves on, and the service then
+    rejects the request as "Invalid constructor input" — an error that points
+    at the payload while the fault is the type.
+
+    Keeping construction out of here also keeps this function free of
+    credentials, so it stays unit-testable without a live client.
+    """
     if not keywords and not page_url:
         raise ToolError(
             "Provide keywords, page_url, or both — there is nothing to seed "
@@ -105,13 +118,6 @@ def _build_request(
             f"{', '.join(sorted(_NETWORKS))}, got '{keyword_plan_network}'."
         )
 
-    # Build the request through the same client that later resolves the
-    # service, so both come from one API version. Importing the type from a
-    # pinned version instead lets the two drift apart the moment the client
-    # moves to a newer default, and the service then rejects the request as
-    # "Invalid constructor input" — an error that points at the payload while
-    # the fault is the type.
-    request = utils.get_googleads_type("GenerateKeywordIdeasRequest")
     request.customer_id = customer_id
     request.language = _resource_name(language, "languageConstants")
     request.geo_target_constants.extend(
@@ -186,6 +192,7 @@ def generate_keyword_ideas(
         values are in micros: divide by 1,000,000 for the account currency.
     """
     request = _build_request(
+        utils.get_googleads_type("GenerateKeywordIdeasRequest"),
         customer_id=customer_id,
         language=language,
         geo_target_constants=geo_target_constants,
