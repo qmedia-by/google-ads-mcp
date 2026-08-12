@@ -38,3 +38,9 @@ issues = "https://github.com/googleads/google-ads-mcp/issues"
 [project.scripts]
 google-ads-mcp = "ads_mcp.server:run_server"
 google-ads-mcp-update-gaql = "ads_mcp.update_references:update_gaql_resource_file"
+
+# The fork adds a top-level docker/ directory, which setuptools' flat-layout auto
+# discovery treats as a second package and refuses to build ("Multiple top-level
+# packages discovered in a flat-layout"). The shipped package is spelled out instead.
+[tool.setuptools.packages.find]
+include = ["ads_mcp*"]
