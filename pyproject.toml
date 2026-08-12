@@ -6,7 +6,12 @@ license = "Apache-2.0"
 dependencies = [
     "google-ads>=31.0.0",
     "mcp[cli]>=1.2.0",
-    "fastmcp>=3.2.0"
+    "fastmcp>=3.2.0",
+    # ads_mcp/auth_storage.py imports key_value.aio.stores.redis, which lives behind
+    # this extra. fastmcp pulls py-key-value-aio in without it, so a redis-backed
+    # deployment fails at import time. Unpinned on purpose: the version is fastmcp's
+    # to choose, we only need the extra.
+    "py-key-value-aio[redis]"
 ]
 
 description = "MCP Server for Google Ads, depends on Google Ads API."

@@ -7,3 +7,5 @@ namespaces:
   customers: true
   search: true
   metadata: true
+  # Fork addition, see FORK.md
+  planning: true

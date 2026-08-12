@@ -1,0 +1,81 @@
+name: google-ads-mcp
+
+# Server stack. The mcp image comes from GHCR, built by CI; redis is a stock image.
+# ONLY mcp is published, on 127.0.0.1:${PORT_MCP}; external access goes through the
+# ispmanager reverse proxy (see FORK.md, "Reverse-proxy в ispmanager").
+#
+# One env file, sitting one level ABOVE this directory because CI rsyncs docker/ on every
+# deploy and would overwrite a file placed inside it. Template: docker/.env.server.example.
+#   cd $DEPLOYMENT_FOLDER
+#   docker compose --env-file .env -f docker/docker-compose-server.yml ...
+#
+# There is no code on the server — everything lives in the image. The only state is the
+# OAuth token store in Redis.
+
+x-logging: &logging
+  # The server is shared between projects; unbounded json-file logs fill its disk.
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
+services:
+  mcp:
+    # Kept in step with `ghcr.io/${{ github.repository }}` in deployment.yml.
+    image: ghcr.io/qmedia-by/google-ads-mcp:${IMAGE_TAG}
+    ports:
+      - "127.0.0.1:${PORT_MCP}:8080"
+    environment:
+      GOOGLE_ADS_DEVELOPER_TOKEN: ${GOOGLE_ADS_DEVELOPER_TOKEN}
+      GOOGLE_ADS_LOGIN_CUSTOMER_ID: ${GOOGLE_ADS_LOGIN_CUSTOMER_ID}
+      GOOGLE_ADS_MCP_OAUTH_CLIENT_ID: ${GOOGLE_ADS_MCP_OAUTH_CLIENT_ID}
+      GOOGLE_ADS_MCP_OAUTH_CLIENT_SECRET: ${GOOGLE_ADS_MCP_OAUTH_CLIENT_SECRET}
+      GOOGLE_ADS_MCP_BASE_URL: ${GOOGLE_ADS_MCP_BASE_URL}
+      # Not strictly required — FastMCP would derive a stable key from the client secret.
+      # Setting it explicitly decouples token lifetime from that secret, so rotating the
+      # secret in GCP does not log the whole department out. See FORK.md.
+      GOOGLE_ADS_MCP_JWT_SIGNING_KEY: ${GOOGLE_ADS_MCP_JWT_SIGNING_KEY}
+      # The storage backend is a property of this stack, not of the environment, so it is
+      # pinned here rather than in .env (the same rule the influenso stack follows).
+      GOOGLE_ADS_MCP_STORAGE_TYPE: redis
+      GOOGLE_ADS_MCP_STORAGE_REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # The only unauthenticated GET route FastMCP serves, and it exists ONLY once the
+      # OAuth provider has initialised — a 200 here proves more than an open port would.
+      # python:3.11-slim ships neither curl nor wget, hence urllib.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/.well-known/oauth-authorization-server', timeout=5)",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging: *logging
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.2-alpine
+    # No maxmemory policy on purpose: an eviction policy would silently drop Managers'
+    # tokens under memory pressure, which is exactly what this Redis exists to prevent.
+    command: redis-server --appendonly yes --requirepass "${REDIS_PASSWORD}"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    logging: *logging
+    restart: unless-stopped
+
+volumes:
+  redis-data:

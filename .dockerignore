@@ -1,0 +1,14 @@
+# The Dockerfile does `COPY . .`; without this file .git alone adds tens of megabytes to
+# the build context and lands inside the image.
+.git
+.github
+.venv
+.nox
+docker
+docs
+*.egg-info
+__pycache__
+*.pyc
+.pytest_cache
+.idea
+.vscode

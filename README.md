@@ -1,5 +1,10 @@
 # Google Ads MCP Server
 
+> **Форк QMedia.** К официальному серверу добавлен один инструмент —
+> `planning_generate_keyword_ideas`, без которого невозможен сбор семантики.
+> Что изменено, на какой базе и как обновляться с upstream — в [FORK.md](FORK.md).
+> Ниже — документация upstream.
+
 This repo contains the source code for running an
 [MCP](https://modelcontextprotocol.io) server that interacts with the
 [Google Ads API](https://developers.google.com/google-ads/api).

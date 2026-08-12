@@ -1,0 +1,197 @@
+name: 🚀 Deploy to server
+
+# Containerised deploy, split into blocks:
+#
+#   quality ──┐   gate: ci.yml (lint + tests + smoke). Red means we stop here.
+#   image   ──┴──> build the server image and push it to GHCR.
+#   release ─────> server: rsync docker/ -> pull + up --wait -> health check,
+#                  restoring the previous IMAGE_TAG on failure.
+#
+# release is deliberately ONE job: the previous tag is captured, switched and restored
+# inside a single shell, and cannot be shared across jobs.
+#
+# Unlike the influenso deploy this copies no application code and takes no backup — the
+# code lives entirely in the image, and the only state is the OAuth token store in Redis,
+# which Google expires after 7 days anyway (qmedia-ads-agent ADR-0007). The one thing
+# worth rolling back is the image tag.
+#
+# One env file on the server: $DEPLOYMENT_FOLDER/.env, created by hand from
+# docker/.env.server.example on the first deploy. CI only ever updates IMAGE_TAG in it.
+#
+# workflow_dispatch with `image_tag` rolls back to an image already in GHCR: quality and
+# image are skipped, because an emergency rollback must not be blocked by a red test suite
+# on the current branch.
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Existing image tag to roll back to (empty = deploy this commit)"
+        required: false
+        type: string
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ══════════════════════════════════════════════════════════════════════
+  # BLOCK 1 — quality gate. Skipped for a rollback, which deploys an image that already
+  # passed this gate when it was built.
+  # ══════════════════════════════════════════════════════════════════════
+  quality:
+    name: 🔦 Quality gate
+    if: inputs.image_tag == ''
+    uses: ./.github/workflows/ci.yml
+
+  # ══════════════════════════════════════════════════════════════════════
+  # BLOCK 2 — image. Skipped for a rollback (its `needs` is skipped, so it is too).
+  # ══════════════════════════════════════════════════════════════════════
+  image:
+    name: 🐳 Build image
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # GITHUB_TOKEN must be able to push images to GHCR; the org default is read-only.
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: 🚚 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔑 Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🐳 Setup buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 🐳 Build & push mcp image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
+            ghcr.io/${{ github.repository }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ══════════════════════════════════════════════════════════════════════
+  # BLOCK 3 — rollout.
+  # ══════════════════════════════════════════════════════════════════════
+  release:
+    name: 🚀 Release
+    needs: [quality, image]
+    # `always()` so a rollback (both previous blocks skipped) still reaches this job,
+    # while a genuine failure in either of them still stops the deploy.
+    if: >-
+      always()
+      && (needs.quality.result == 'success' || needs.quality.result == 'skipped')
+      && (needs.image.result == 'success' || needs.image.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    environment: production
+    env:
+      TARGET_TAG: ${{ inputs.image_tag || github.sha }}
+
+    steps:
+      - name: 🚚 Checkout code
+        uses: actions/checkout@v4
+
+      # The one-off server bootstrap (.env + the ispmanager proxy) is done by hand — see
+      # FORK.md. This catches a missing or half-filled .env before anything is touched.
+      - name: 🧪 Preflight — server .env exists & filled
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOYMENT_HOST }}
+          username: ${{ secrets.DEPLOYMENT_USER }}
+          key: ${{ secrets.DEPLOYMENT_SSH_PRIVATE_KEY }}
+          script_stop: true
+          script: |
+            ENV_FILE="${{ secrets.DEPLOYMENT_FOLDER }}/.env"
+            if [ ! -f "$ENV_FILE" ]; then
+              echo "::error::Нет $ENV_FILE — создай его из docker/.env.server.example (одноразовый бутстрап, порядок шагов в FORK.md)"
+              exit 1
+            fi
+            if grep -q "CHANGE_ME" "$ENV_FILE"; then
+              echo "::error::В $ENV_FILE остались плейсхолдеры CHANGE_ME — заполни секреты"
+              exit 1
+            fi
+            for var in PORT_MCP IMAGE_TAG REDIS_PASSWORD GOOGLE_ADS_DEVELOPER_TOKEN \
+                       GOOGLE_ADS_LOGIN_CUSTOMER_ID GOOGLE_ADS_MCP_OAUTH_CLIENT_ID \
+                       GOOGLE_ADS_MCP_OAUTH_CLIENT_SECRET GOOGLE_ADS_MCP_BASE_URL \
+                       GOOGLE_ADS_MCP_JWT_SIGNING_KEY; do
+              if ! grep -q "^${var}=" "$ENV_FILE"; then
+                echo "::error::В $ENV_FILE отсутствует обязательная переменная ${var}"
+                exit 1
+              fi
+            done
+            echo "Preflight OK: $ENV_FILE is filled"
+
+      # Only the compose file travels — a couple of kilobytes. The application is in the
+      # image, and .env deliberately lives outside this directory so it survives the sync.
+      - name: 🚀 Deploy compose files
+        uses: easingthemes/ssh-deploy@main
+        with:
+          SSH_PRIVATE_KEY: ${{ secrets.DEPLOYMENT_SSH_PRIVATE_KEY }}
+          ARGS: "-rlgoDzvc -i"
+          SOURCE: "docker/"
+          REMOTE_HOST: ${{ secrets.DEPLOYMENT_HOST }}
+          REMOTE_USER: ${{ secrets.DEPLOYMENT_USER }}
+          TARGET: ${{ secrets.DEPLOYMENT_FOLDER }}/docker
+
+      # Capture, switch, verify and roll back all in one shell: the previous tag is a
+      # shell variable, and splitting the steps would mean plumbing it through action
+      # outputs for no gain. script_stop stays off — the failure paths are explicit,
+      # because an early exit would skip the rollback.
+      - name: 🐳 Pull image, restart stack & health check
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOYMENT_HOST }}
+          username: ${{ secrets.DEPLOYMENT_USER }}
+          key: ${{ secrets.DEPLOYMENT_SSH_PRIVATE_KEY }}
+          envs: TARGET_TAG
+          script: |
+            cd ${{ secrets.DEPLOYMENT_FOLDER }} || exit 1
+            COMPOSE="docker compose --env-file .env -f docker/docker-compose-server.yml"
+            PREVIOUS_TAG=$(grep '^IMAGE_TAG=' .env | cut -d= -f2)
+            echo "IMAGE_TAG: ${PREVIOUS_TAG} -> ${TARGET_TAG}"
+
+            fail() {
+              $COMPOSE logs --tail 50 mcp
+              if [ -n "$PREVIOUS_TAG" ] && [ "$PREVIOUS_TAG" != "$TARGET_TAG" ]; then
+                echo "::warning::Откат на ${PREVIOUS_TAG}"
+                sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=${PREVIOUS_TAG}|" .env
+                $COMPOSE up -d --remove-orphans
+              else
+                echo "::error::Откат невозможен — предыдущий тег отсутствует или совпадает с новым"
+              fi
+              docker logout ghcr.io
+              exit 1
+            }
+
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin || exit 1
+            sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=${TARGET_TAG}|" .env
+
+            $COMPOSE pull || fail
+            $COMPOSE up -d --remove-orphans --wait --wait-timeout 120 || fail
+
+            PORT=$(grep '^PORT_MCP=' .env | cut -d= -f2)
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/.well-known/oauth-authorization-server")
+            echo "HTTP ${code}"
+            [ "$code" = "200" ] || fail
+
+            # Dangling images only — this cannot delete the SHA tag a rollback needs.
+            docker image prune -f
+            docker logout ghcr.io

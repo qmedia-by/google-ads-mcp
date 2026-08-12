@@ -70,6 +70,95 @@
       "annotations": {
         "readOnlyHint": true
       },
+      "description": "Generates keyword ideas with demand metrics for a market.\n\nUse to build or extend a keyword core. This is the only way to obtain new\nkeyword ideas and search volumes: they are not queryable through GAQL, so\nthe `search` tool cannot return them. Use `search` on `keyword_view` or\n`search_term_view` instead when you need what an account already runs.\n\nRequires a developer token with the \"Researching keywords and\nrecommendations\" permissible use. Explorer access level cannot call this.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "customer_id": {
+            "description": "The id of the customer, digits only, no hyphens.",
+            "type": "string"
+          },
+          "geo_target_constants": {
+            "description": "Up to 10 geo target constants, e.g. ['2112'].",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "include_adult_keywords": {
+            "default": false,
+            "description": "Whether adult keywords may be returned.",
+            "type": "boolean"
+          },
+          "keyword_plan_network": {
+            "default": "GOOGLE_SEARCH",
+            "description": "GOOGLE_SEARCH or GOOGLE_SEARCH_AND_PARTNERS.",
+            "type": "string"
+          },
+          "keywords": {
+            "default": [],
+            "description": "Seed phrases. Either this or page_url is required.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "language": {
+            "description": "Language constant, e.g. '1031' or 'languageConstants/1031'.",
+            "type": "string"
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Maximum number of ideas to return."
+          },
+          "page_url": {
+            "default": "",
+            "description": "Seed page. Combined with keywords when both are given.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "customer_id",
+          "language",
+          "geo_target_constants"
+        ],
+        "type": "object"
+      },
+      "name": "planning_generate_keyword_ideas",
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "type": "object",
+        "x-fastmcp-wrap-result": true
+      }
+    },
+    {
+      "_meta": {
+        "fastmcp": {
+          "tags": []
+        }
+      },
+      "annotations": {
+        "readOnlyHint": true
+      },
       "description": "Fetches data from the Google Ads API using the search method",
       "inputSchema": {
         "additionalProperties": false,
