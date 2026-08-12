@@ -24,6 +24,7 @@
 | `ads_mcp/config.py` | +1 строка: `"planning"` в `ALL_CATEGORIES` |
 | `tests/smoke/golden_tools_list.json` | перегенерирован: +89 строк описания нового инструмента |
 | `pyproject.toml` | +1 зависимость: `py-key-value-aio[redis]` — без неё redis-хранилище падает на импорте |
+| `ads_mcp/coordinator.py` | +1 аргумент: `enable_cimd=False` — иначе вход через Claude Code не работает, см. ниже |
 | `docker/docker-compose-server.yml` | **новый** — серверный стек: `mcp` + `redis` |
 | `docker/.env.server.example` | **новый** — шаблон серверного `.env` |
 | `.dockerignore` | **новый** — иначе `COPY . .` тащит `.git` внутрь образа |
@@ -33,7 +34,7 @@
 
 Дельта намеренно минимальна: чем меньше тронуто, тем реже конфликты при обновлении upstream. `KeywordPlanService` (прогнозы) и `RecommendationService` не добавляем, пока их не попросят.
 
-Строка в `pyproject.toml` — единственная правка upstream-файла ради развёртывания, и она же кандидат в upstream-PR: их README рекомендует redis для продакшена, а поставить его нечем. Остальное деплоя касается только новыми файлами.
+Строка в `pyproject.toml` и аргумент в `coordinator.py` — единственные правки upstream-файлов ради развёртывания. Первая же кандидат в upstream-PR: их README рекомендует redis для продакшена, а поставить его нечем. Остальное деплоя касается только новыми файлами.
 
 Инструмент называется `planning_generate_keyword_ideas` — namespace добавляет префикс, как у `customers_`, `search_` и `metadata_`.
 
@@ -95,6 +96,16 @@ Docker на хостинге агентства, рядом Redis. Google Cloud 
 `GOOGLE_ADS_MCP_JWT_SIGNING_KEY` строго обязательным при этом **не** является, вопреки тому, что можно предположить: не задав его, FastMCP выводит ключ подписи детерминированно из `GOOGLE_ADS_MCP_OAUTH_CLIENT_SECRET` — HKDF с фиксированной солью, `fastmcp/server/auth/jwt_issuer.py`. После перезапуска ключ будет тем же, и токены останутся валидными.
 
 Мы всё равно задаём его явно, и не ради перезапусков: с ним срок жизни токенов не привязан к client secret, и ротация секрета в GCP не разлогинивает весь отдел заодно. Цена — обратная связь: ротация самого ключа разлогинивает всех и обнуляет хранилище, потому что `ads_mcp/auth_storage.py` выводит из него же ключ шифрования. Отдельный `GOOGLE_ADS_MCP_STORAGE_ENCRYPTION_KEY` поэтому не заводим — одним секретом меньше.
+
+### Регистрация клиентов: CIMD выключен
+
+`GoogleProvider` по умолчанию включает **CIMD** (Client ID Metadata Document) — `enable_cimd: bool = True`. Когда он включён, сервер безусловно ставит `client_id_metadata_document_supported: true` в `/.well-known/oauth-authorization-server` (`fastmcp/server/auth/oauth_proxy/proxy.py:2107`), не проверяя, способен ли он этот документ забрать.
+
+Дальше цепочка ломается: Claude Code видит флаг, **пропускает** динамическую регистрацию и подставляет URL-client_id `https://claude.ai/oauth/claude-code-client-metadata`. Сервер должен сам сходить по этому URL — из контейнера это не работает, и `/authorize` отбивает клиента страницей «client ID was not found in the server's client registry». Совет с той страницы («сбросьте токены и переподключитесь») зацикливает: после переподключения клиент прочитает тот же флаг и подставит тот же URL. Настоящая причина уходит в `logger.warning` (`fastmcp/server/auth/cimd.py:745`, строка `CIMD fetch failed`).
+
+Поэтому в `ads_mcp/coordinator.py` передаём `enable_cimd=False`. Флаг уходит из метаданных, клиенты возвращаются к регистрации через `/register`, а она у нас рабочая и переживает перезапуск — регистрации лежат в Redis. Вариант с открытием egress до `claude.ai` отвергнут: он привязывает вход Менеджеров к доступности стороннего домена за Cloudflare. Вернуть CIMD имеет смысл, только если появится клиент, не умеющий динамическую регистрацию, — и тогда egress придётся проверять отдельно.
+
+Разбор целиком — `docs/feedback/2026-08-12-cimd-authorize-failure.md`. Проверено на `fastmcp 3.4.7`; в `pyproject.toml` стоит `fastmcp>=3.2.0`, так что при обновлении FastMCP стоит убедиться, что аргумент не переименован.
 
 ### Переменные окружения
 

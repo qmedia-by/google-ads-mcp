@@ -42,6 +42,11 @@ if _CLIENT_ID and _CLIENT_SECRET:
             "https://www.googleapis.com/auth/userinfo.profile",
             "https://www.googleapis.com/auth/adwords",
         ],
+        # Fork addition, see FORK.md. CIMD makes the server fetch the client
+        # metadata document itself; without egress to claude.ai that fetch
+        # fails and /authorize rejects the client. Disabling the flag keeps
+        # clients on dynamic registration, which our Redis storage persists.
+        "enable_cimd": False,
     }
     if _JWT_SIGNING_KEY:
         provider_kwargs["jwt_signing_key"] = _JWT_SIGNING_KEY
