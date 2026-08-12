@@ -102,7 +102,7 @@ Docker на хостинге агентства, рядом Redis. Google Cloud 
 
 | Переменная | Назначение |
 |---|---|
-| `PORT_MCP` | хостовый порт для reverse-proxy, `16010`. Должен быть уникален на сервере |
+| `PORT_MCP` | хостовый порт для reverse-proxy, `16800`. Должен быть уникален на сервере |
 | `IMAGE_TAG` | тег образа; переписывается CI при каждом деплое |
 | `REDIS_PASSWORD` | пароль Redis, `openssl rand -hex 16` |
 | `GOOGLE_ADS_DEVELOPER_TOKEN` | developer token агентства |
@@ -147,7 +147,7 @@ MCP по streamable HTTP держит длинные SSE-ответы, и деф
 
 ```nginx
 location / {
-    proxy_pass http://127.0.0.1:16010;
+    proxy_pass http://127.0.0.1:16800;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header Connection "";
