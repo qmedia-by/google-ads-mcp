@@ -1,7 +1,8 @@
 # Google Ads MCP Server
 
-> **Форк QMedia.** К официальному серверу добавлен один инструмент —
-> `planning_generate_keyword_ideas`, без которого невозможен сбор семантики.
+> **Форк QMedia.** К официальному серверу добавлены инструмент
+> `planning_generate_keyword_ideas`, без которого невозможен сбор семантики,
+> и allowlist Аккаунтов — переменная `GOOGLE_ADS_ALLOWED_CUSTOMER_IDS`.
 > Что изменено, на какой базе и как обновляться с upstream — в [FORK.md](FORK.md).
 > Ниже — документация upstream.
 

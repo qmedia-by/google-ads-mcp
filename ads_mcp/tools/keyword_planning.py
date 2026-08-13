@@ -28,6 +28,7 @@ from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 import ads_mcp.utils as utils
+from ads_mcp.access_control import ensure_customer_id_allowed
 
 from google.ads.googleads.errors import GoogleAdsException
 from google.ads.googleads.v24.enums.types.keyword_plan_network import (
@@ -312,6 +313,8 @@ def generate_keyword_ideas(
         when the API reported no data — which is not the same as zero. Bid
         values are in micros: divide by 1,000,000 for the account currency.
     """
+    ensure_customer_id_allowed(customer_id)
+
     request = _build_request(
         utils.get_googleads_type("GenerateKeywordIdeasRequest"),
         customer_id=customer_id,

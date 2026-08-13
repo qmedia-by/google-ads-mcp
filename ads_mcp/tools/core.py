@@ -19,6 +19,7 @@ from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 import ads_mcp.utils as utils
+from ads_mcp.access_control import filter_allowed_customer_ids
 
 from google.ads.googleads.v24.services.types.customer_service import (
     ListAccessibleCustomersResponse,
@@ -42,7 +43,9 @@ def list_accessible_customers() -> List[str]:
         ga_service.list_accessible_customers()
     )
     # remove customer/ from the start of each resource
-    return [
+    # Filtered, not refused: offering an account the caller may not query
+    # would only invite a request that gets rejected later (see FORK.md).
+    return filter_allowed_customer_ids(
         cust_rn.removeprefix("customers/")
         for cust_rn in accessible_customers.resource_names
-    ]
+    )

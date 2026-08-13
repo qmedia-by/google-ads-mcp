@@ -22,6 +22,7 @@ from mcp.types import ToolAnnotations
 search_mcp = FastMCP("search")
 
 import ads_mcp.utils as utils
+from ads_mcp.access_control import ensure_customer_id_allowed
 from google.ads.googleads.errors import GoogleAdsException
 from fastmcp.exceptions import ToolError
 
@@ -45,6 +46,8 @@ def search(
         limit: The maximum number of rows to return
 
     """
+
+    ensure_customer_id_allowed(customer_id)
 
     ga_service = utils.get_googleads_service("GoogleAdsService")
 
