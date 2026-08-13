@@ -20,6 +20,7 @@ tool queries resources, while generating keyword ideas is a separate RPC. See
 FORK.md.
 """
 
+import time
 from typing import Any, Dict, List
 
 from fastmcp import FastMCP
@@ -32,11 +33,33 @@ from google.ads.googleads.errors import GoogleAdsException
 from google.ads.googleads.v24.enums.types.keyword_plan_network import (
     KeywordPlanNetworkEnum,
 )
+from google.ads.googleads.v24.errors.types.internal_error import (
+    InternalErrorEnum,
+)
 
 planning_mcp = FastMCP("planning")
 
 # The API rejects requests carrying more than ten geo target constants.
 _MAX_GEO_TARGET_CONSTANTS = 10
+
+# Errors Google itself describes as worth repeating: TRANSIENT_ERROR carries
+# "The user should retry their request in these cases" in the API's own enum
+# documentation, and DEADLINE_EXCEEDED is the same overload seen from the other
+# side — the request was accepted and simply did not finish in time.
+#
+# A tuple rather than a set on purpose: membership then compares by value, so
+# an error raised by a client on a newer API version still matches these
+# constants. Set membership would compare by hash and tie the match to the enum
+# class the error was built from.
+_RETRYABLE_INTERNAL_ERRORS = (
+    InternalErrorEnum.InternalError.TRANSIENT_ERROR,
+    InternalErrorEnum.InternalError.DEADLINE_EXCEEDED,
+)
+
+# Pauses before each retry. Deliberately short: the dominant gap between
+# attempts is the failed call itself, which only returns once Google's own
+# deadline has run out.
+_RETRY_DELAYS_SECONDS = (2.0, 4.0)
 
 _NETWORKS = {
     "GOOGLE_SEARCH": KeywordPlanNetworkEnum.KeywordPlanNetwork.GOOGLE_SEARCH,
@@ -155,6 +178,95 @@ def _format_idea(idea: Any) -> Dict[str, Any]:
     }
 
 
+def _is_retryable(failure: Any) -> bool:
+    """Reports whether a failure is one the API asks the caller to repeat.
+
+    Every error in the failure has to be retryable, not just one of them: a
+    failure that also carries a permanent error — a malformed field, a missing
+    permission — would be rejected again for that same reason, and repeating it
+    only delays the refusal.
+    """
+    errors = list(failure.errors)
+    if not errors:
+        return False
+    for error in errors:
+        code = error.error_code
+        # The error code is a oneof: reading `internal_error` on a failure of
+        # some other kind would silently yield UNSPECIFIED instead of saying
+        # that no internal error was reported at all.
+        if code._pb.WhichOneof("error_code") != "internal_error":
+            return False
+        if code.internal_error not in _RETRYABLE_INTERNAL_ERRORS:
+            return False
+    return True
+
+
+def _as_tool_error(ex: GoogleAdsException) -> ToolError:
+    """Renders a failure the way the rest of the server renders them."""
+    error_msgs = [
+        f"Google Ads API Error: {error.message}" for error in ex.failure.errors
+    ]
+    return ToolError(f"Request ID: {ex.request_id}\n" + "\n".join(error_msgs))
+
+
+def _collect_ideas(
+    service: Any, request: Any, limit: int | None
+) -> List[Dict[str, Any]]:
+    """Runs the RPC once and flattens the response into rows.
+
+    The fresh list per call is what makes retrying safe: the response is a
+    pager that fetches later pages lazily, so a failure can arrive with some
+    ideas already read, and the next attempt has to start from an empty list
+    rather than append to a half-filled one.
+    """
+    response = service.generate_keyword_ideas(request=request)
+
+    ideas: List[Dict[str, Any]] = []
+    for idea in response:
+        ideas.append(_format_idea(idea))
+        if limit and len(ideas) >= limit:
+            break
+    return ideas
+
+
+def _generate_ideas(
+    service: Any, request: Any, limit: int | None
+) -> List[Dict[str, Any]]:
+    """Collects ideas, repeating the attempt on transient API failures.
+
+    Without this, a single overload on Google's side ends the whole run: the
+    caller is an agent building a keyword core out of many calls, and it reads
+    any `ToolError` as final. Nothing below the tool retries either — the
+    generated transport wraps this RPC without a default retry policy, and the
+    `retry` argument the method accepts only sees transport-level status codes,
+    not the `GoogleAdsFailure` this arrives in.
+    """
+    attempts = len(_RETRY_DELAYS_SECONDS) + 1
+
+    for attempt in range(attempts):
+        try:
+            return _collect_ideas(service, request, limit)
+        except GoogleAdsException as ex:
+            is_last = attempt == attempts - 1
+            if is_last or not _is_retryable(ex.failure):
+                raise _as_tool_error(ex)
+
+            delay = _RETRY_DELAYS_SECONDS[attempt]
+            utils.logger.warning(
+                "ads_mcp.generate_keyword_ideas transient failure, retrying "
+                "in %ss (attempt %s of %s, request_id=%s): %s",
+                delay,
+                attempt + 1,
+                attempts,
+                ex.request_id,
+                "; ".join(error.message for error in ex.failure.errors),
+            )
+            time.sleep(delay)
+
+    # Unreachable: the last attempt either returns or raises above.
+    raise AssertionError("retry loop exited without a result")
+
+
 @planning_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def generate_keyword_ideas(
     customer_id: str,
@@ -176,6 +288,11 @@ def generate_keyword_ideas(
     Requires a developer token with the "Researching keywords and
     recommendations" permissible use. Explorer access level cannot call this.
 
+    Call this sequentially rather than in parallel. Several heavy calls at once
+    overload the API and it answers "The request took too long to respond." The
+    tool retries that failure a few times on its own, so an occasional one costs
+    only time, but firing a batch of calls together makes it the normal case.
+
     Args:
         customer_id: The id of the customer, digits only, no hyphens.
         language: Language constant, e.g. '1031' or 'languageConstants/1031'.
@@ -184,7 +301,11 @@ def generate_keyword_ideas(
         page_url: Seed page. Combined with keywords when both are given.
         keyword_plan_network: GOOGLE_SEARCH or GOOGLE_SEARCH_AND_PARTNERS.
         include_adult_keywords: Whether adult keywords may be returned.
-        limit: Maximum number of ideas to return.
+        limit: Maximum number of ideas to return. This truncates the answer,
+            it does not narrow the request: the API is asked for everything
+            it has and the extra ideas are dropped here. A small limit is
+            therefore no protection against the overload timeout — fewer seed
+            phrases per call is what shortens the work.
 
     Returns:
         A list of ideas. `avg_monthly_searches` and the bid fields are null
@@ -211,20 +332,4 @@ def generate_keyword_ideas(
 
     service = utils.get_googleads_service("KeywordPlanIdeaService")
 
-    try:
-        response = service.generate_keyword_ideas(request=request)
-
-        ideas: List[Dict[str, Any]] = []
-        for idea in response:
-            ideas.append(_format_idea(idea))
-            if limit and len(ideas) >= limit:
-                break
-        return ideas
-    except GoogleAdsException as ex:
-        error_msgs = [
-            f"Google Ads API Error: {error.message}"
-            for error in ex.failure.errors
-        ]
-        raise ToolError(
-            f"Request ID: {ex.request_id}\n" + "\n".join(error_msgs)
-        )
+    return _generate_ideas(service, request, limit)

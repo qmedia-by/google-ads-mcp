@@ -70,7 +70,7 @@
       "annotations": {
         "readOnlyHint": true
       },
-      "description": "Generates keyword ideas with demand metrics for a market.\n\nUse to build or extend a keyword core. This is the only way to obtain new\nkeyword ideas and search volumes: they are not queryable through GAQL, so\nthe `search` tool cannot return them. Use `search` on `keyword_view` or\n`search_term_view` instead when you need what an account already runs.\n\nRequires a developer token with the \"Researching keywords and\nrecommendations\" permissible use. Explorer access level cannot call this.",
+      "description": "Generates keyword ideas with demand metrics for a market.\n\nUse to build or extend a keyword core. This is the only way to obtain new\nkeyword ideas and search volumes: they are not queryable through GAQL, so\nthe `search` tool cannot return them. Use `search` on `keyword_view` or\n`search_term_view` instead when you need what an account already runs.\n\nRequires a developer token with the \"Researching keywords and\nrecommendations\" permissible use. Explorer access level cannot call this.\n\nCall this sequentially rather than in parallel. Several heavy calls at once\noverload the API and it answers \"The request took too long to respond.\" The\ntool retries that failure a few times on its own, so an occasional one costs\nonly time, but firing a batch of calls together makes it the normal case.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -117,7 +117,7 @@
               }
             ],
             "default": null,
-            "description": "Maximum number of ideas to return."
+            "description": "Maximum number of ideas to return. This truncates the answer,\nit does not narrow the request: the API is asked for everything\nit has and the extra ideas are dropped here. A small limit is\ntherefore no protection against the overload timeout \u2014 fewer seed\nphrases per call is what shortens the work."
           },
           "page_url": {
             "default": "",
