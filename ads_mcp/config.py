@@ -28,8 +28,14 @@ DEFAULT_CONFIG_FILE = "tools_config.yaml"
 CONFIG_PATH_ENV_VAR = "GOOGLE_ADS_MCP_TOOLS_CONFIG"
 
 # Default categories that are supported by the server.
-# "planning" is a fork addition, see FORK.md.
-ALL_CATEGORIES = ["customers", "search", "metadata", "planning"]
+# "planning" and "registry" are fork additions, see FORK.md.
+ALL_CATEGORIES = [
+    "customers",
+    "search",
+    "metadata",
+    "planning",
+    "registry",
+]
 
 
 class ToolsConfig:

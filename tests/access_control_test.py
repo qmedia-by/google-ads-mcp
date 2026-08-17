@@ -12,104 +12,151 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Test cases for the customer id allowlist (fork addition)."""
+"""Test cases for the account allowlist (fork addition).
 
-import os
+The allowlist is the Registry, so these tests stand a snapshot up in place of
+the Sheet rather than set an environment variable.
+"""
+
+import contextlib
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
 from fastmcp.exceptions import ToolError
 
 from ads_mcp.access_control import (
-    ALLOWED_CUSTOMER_IDS_ENV_VAR,
     ensure_customer_id_allowed,
     filter_allowed_customer_ids,
     get_allowed_customer_ids,
 )
+from ads_mcp.registry import Client, RegistrySnapshot
 
 
-def with_allowlist(value: str):
-    """Sets the allowlist env var for the duration of a block."""
-    return patch.dict("os.environ", {ALLOWED_CUSTOMER_IDS_ENV_VAR: value})
+def snapshot_of(*customer_ids: str, age: float = 0.0) -> RegistrySnapshot:
+    """A Registry holding one Client per id given."""
+    return RegistrySnapshot(
+        clients=tuple(
+            Client(name=f"client-{number}.by", accounts={"google_ads": (cid,)})
+            for number, cid in enumerate(customer_ids, start=1)
+        ),
+        problems=(),
+        fetched_at=time.time() - age,
+    )
 
 
-def without_allowlist():
-    """Removes the allowlist env var for the duration of a block.
+@contextlib.contextmanager
+def with_registry(snapshot: RegistrySnapshot):
+    """Runs the block with a configured, readable Registry."""
+    with (
+        patch("ads_mcp.registry.is_configured", return_value=True),
+        patch("ads_mcp.registry_cache.get_snapshot", return_value=snapshot),
+    ):
+        yield
 
-    Only that one variable — clearing the whole environment would take the
-    credentials and config the rest of the server reads along with it.
-    """
-    environment = os.environ.copy()
-    environment.pop(ALLOWED_CUSTOMER_IDS_ENV_VAR, None)
-    return patch.dict("os.environ", environment, clear=True)
+
+@contextlib.contextmanager
+def without_registry():
+    """Runs the block with no Registry configured at all."""
+    with patch("ads_mcp.registry.is_configured", return_value=False):
+        yield
+
+
+@contextlib.contextmanager
+def with_unreadable_registry():
+    """Runs the block with a Registry configured but nothing to read."""
+    with (
+        patch("ads_mcp.registry.is_configured", return_value=True),
+        patch("ads_mcp.registry_cache.get_snapshot", return_value=None),
+    ):
+        yield
 
 
 class TestGetAllowedCustomerIds(unittest.TestCase):
-    def test_unset_means_unrestricted(self):
-        # Upstream ships no allowlist, and the same image must keep working
-        # for anyone who never sets the variable.
-        with without_allowlist():
+    def test_no_registry_means_unrestricted(self):
+        # Upstream ships no allowlist, and the same image has to keep working
+        # for anyone running it without a service account.
+        with without_registry():
             self.assertIsNone(get_allowed_customer_ids())
 
-    def test_empty_means_unrestricted(self):
-        with with_allowlist("   "):
-            self.assertIsNone(get_allowed_customer_ids())
-
-    def test_parses_a_list(self):
-        with with_allowlist("1234567890,2222222222"):
+    def test_reads_the_ids_out_of_the_registry(self):
+        with with_registry(snapshot_of("1234567890", "2222222222")):
             self.assertEqual(
                 get_allowed_customer_ids(),
                 frozenset({"1234567890", "2222222222"}),
             )
 
-    def test_tolerates_spacing_and_trailing_commas(self):
-        with with_allowlist(" 1234567890 , 2222222222 , "):
+    def test_ignores_clients_without_a_google_ads_account(self):
+        snapshot = RegistrySnapshot(
+            clients=(
+                Client(name="ads.by", accounts={"google_ads": ("1234567890",)}),
+                Client(name="vk-only.by", accounts={"vk": ("42",)}),
+            ),
+            problems=(),
+            fetched_at=time.time(),
+        )
+        with with_registry(snapshot):
+            self.assertEqual(
+                get_allowed_customer_ids(), frozenset({"1234567890"})
+            )
+
+    def test_collects_every_cabinet_of_a_client_with_several(self):
+        snapshot = RegistrySnapshot(
+            clients=(
+                Client(
+                    name="split.by",
+                    accounts={"google_ads": ("1111111111", "2222222222")},
+                ),
+            ),
+            problems=(),
+            fetched_at=time.time(),
+        )
+        with with_registry(snapshot):
             self.assertEqual(
                 get_allowed_customer_ids(),
-                frozenset({"1234567890", "2222222222"}),
+                frozenset({"1111111111", "2222222222"}),
             )
 
-    def test_stores_hyphenated_entries_as_digits(self):
-        with with_allowlist("123-456-7890"):
-            self.assertEqual(
-                get_allowed_customer_ids(), frozenset({"1234567890"})
-            )
+    def test_unreadable_registry_refuses_rather_than_permits(self):
+        # The whole point of the layer: an allowlist that cannot be read is
+        # unknown, and an unknown allowlist is not an empty one.
+        with with_unreadable_registry():
+            with self.assertRaises(ToolError):
+                get_allowed_customer_ids()
 
-    def test_drops_entries_that_cannot_be_an_id(self):
-        with with_allowlist("1234567890,not-an-id"):
-            self.assertEqual(
-                get_allowed_customer_ids(), frozenset({"1234567890"})
-            )
-
-    def test_set_but_all_entries_invalid_allows_nothing(self):
-        # Fails closed on purpose: a misconfigured allowlist that silently
-        # lets everything through is the exact hole this module closes.
-        with with_allowlist("oops"):
+    def test_registry_without_any_google_ads_accounts_allows_nothing(self):
+        snapshot = RegistrySnapshot(
+            clients=(Client(name="vk-only.by", accounts={"vk": ("42",)}),),
+            problems=(),
+            fetched_at=time.time(),
+        )
+        with with_registry(snapshot):
             self.assertEqual(get_allowed_customer_ids(), frozenset())
 
 
 class TestEnsureCustomerIdAllowed(unittest.TestCase):
-    def test_allows_anything_when_unset(self):
-        with without_allowlist():
+    def test_allows_anything_without_a_registry(self):
+        with without_registry():
             ensure_customer_id_allowed("9999999999")
 
     def test_allows_a_listed_account(self):
-        with with_allowlist("1234567890,2222222222"):
+        with with_registry(snapshot_of("1234567890", "2222222222")):
             ensure_customer_id_allowed("2222222222")
 
     def test_allows_a_listed_account_written_with_hyphens(self):
-        with with_allowlist("1234567890"):
+        # Managers copy ids out of the Google Ads UI, which hyphenates them.
+        with with_registry(snapshot_of("1234567890")):
             ensure_customer_id_allowed("123-456-7890")
 
     def test_refuses_an_unlisted_account(self):
-        with with_allowlist("1234567890"):
+        with with_registry(snapshot_of("1234567890")):
             with self.assertRaises(ToolError):
                 ensure_customer_id_allowed("9999999999")
 
     def test_refusal_names_the_account_and_the_alternatives(self):
-        # The manager reads this through the agent, so it has to say which
+        # The Manager reads this through the agent, so it has to say which
         # account was refused and what may be used instead.
-        with with_allowlist("1234567890,2222222222"):
+        with with_registry(snapshot_of("1234567890", "2222222222")):
             with self.assertRaises(ToolError) as context:
                 ensure_customer_id_allowed("9999999999")
 
@@ -117,28 +164,42 @@ class TestEnsureCustomerIdAllowed(unittest.TestCase):
         self.assertIn("9999999999", message)
         self.assertIn("1234567890", message)
         self.assertIn("2222222222", message)
-        self.assertIn(ALLOWED_CUSTOMER_IDS_ENV_VAR, message)
+        self.assertIn("Registry", message)
 
-    def test_refusal_when_allowlist_is_unusable_points_at_the_server(self):
-        with with_allowlist("oops"):
+    def test_refusal_when_the_registry_has_no_accounts_points_at_the_server(
+        self,
+    ):
+        snapshot = RegistrySnapshot(
+            clients=(Client(name="vk-only.by", accounts={"vk": ("42",)}),),
+            problems=(),
+            fetched_at=time.time(),
+        )
+        with with_registry(snapshot):
             with self.assertRaises(ToolError) as context:
                 ensure_customer_id_allowed("1234567890")
 
         message = str(context.exception)
         self.assertIn("1234567890", message)
-        self.assertIn(ALLOWED_CUSTOMER_IDS_ENV_VAR, message)
+        self.assertIn("administers", message)
+
+    def test_unreadable_registry_refuses_and_says_who_can_fix_it(self):
+        with with_unreadable_registry():
+            with self.assertRaises(ToolError) as context:
+                ensure_customer_id_allowed("1234567890")
+
+        self.assertIn("administers", str(context.exception))
 
 
 class TestFilterAllowedCustomerIds(unittest.TestCase):
-    def test_passes_everything_through_when_unset(self):
-        with without_allowlist():
+    def test_passes_everything_through_without_a_registry(self):
+        with without_registry():
             self.assertEqual(
                 filter_allowed_customer_ids(["1111111111", "2222222222"]),
                 ["1111111111", "2222222222"],
             )
 
     def test_keeps_only_listed_accounts_in_order(self):
-        with with_allowlist("3333333333,1111111111"):
+        with with_registry(snapshot_of("3333333333", "1111111111")):
             self.assertEqual(
                 filter_allowed_customer_ids(
                     ["1111111111", "2222222222", "3333333333"]
@@ -149,7 +210,7 @@ class TestFilterAllowedCustomerIds(unittest.TestCase):
     def test_accepts_a_generator(self):
         # core.list_accessible_customers passes one rather than build a list
         # it would immediately throw away.
-        with with_allowlist("1111111111"):
+        with with_registry(snapshot_of("1111111111")):
             self.assertEqual(
                 filter_allowed_customer_ids(
                     cid for cid in ["1111111111", "2222222222"]
@@ -158,10 +219,18 @@ class TestFilterAllowedCustomerIds(unittest.TestCase):
             )
 
     def test_no_overlap_yields_an_empty_list(self):
-        with with_allowlist("4444444444"):
+        with with_registry(snapshot_of("4444444444")):
             self.assertEqual(
                 filter_allowed_customer_ids(["1111111111", "2222222222"]), []
             )
+
+    def test_unreadable_registry_refuses_rather_than_hiding_everything(self):
+        # Returning [] here would read to the Manager as "you have no
+        # accounts", which is a different and much more alarming statement
+        # than "the server cannot reach its Registry right now".
+        with with_unreadable_registry():
+            with self.assertRaises(ToolError):
+                filter_allowed_customer_ids(["1111111111"])
 
 
 class TestToolsHonourTheAllowlist(unittest.TestCase):
@@ -171,7 +240,7 @@ class TestToolsHonourTheAllowlist(unittest.TestCase):
     def test_search_refuses_before_calling_the_api(self, mock_get_service):
         from ads_mcp.tools import search
 
-        with with_allowlist("1234567890"):
+        with with_registry(snapshot_of("1234567890")):
             with self.assertRaises(ToolError) as context:
                 search.search(
                     customer_id="9999999999",
@@ -190,7 +259,7 @@ class TestToolsHonourTheAllowlist(unittest.TestCase):
         mock_get_service.return_value = mock_service
         mock_service.search_stream.return_value = []
 
-        with with_allowlist("1234567890"):
+        with with_registry(snapshot_of("1234567890")):
             results = search.search(
                 customer_id="1234567890",
                 fields=["campaign.id"],
@@ -206,7 +275,7 @@ class TestToolsHonourTheAllowlist(unittest.TestCase):
     ):
         from ads_mcp.tools import keyword_planning
 
-        with with_allowlist("1234567890"):
+        with with_registry(snapshot_of("1234567890")):
             with self.assertRaises(ToolError) as context:
                 keyword_planning.generate_keyword_ideas(
                     customer_id="9999999999",
@@ -227,7 +296,7 @@ class TestToolsHonourTheAllowlist(unittest.TestCase):
         # fixing the wrong thing.
         from ads_mcp.tools import keyword_planning
 
-        with with_allowlist("1234567890"):
+        with with_registry(snapshot_of("1234567890")):
             with self.assertRaises(ToolError) as context:
                 keyword_planning.generate_keyword_ideas(
                     customer_id="9999999999",
@@ -254,7 +323,7 @@ class TestToolsHonourTheAllowlist(unittest.TestCase):
             "customers/3333333333",
         ]
 
-        with with_allowlist("1111111111,3333333333"):
+        with with_registry(snapshot_of("1111111111", "3333333333")):
             self.assertEqual(
                 core.list_accessible_customers(),
                 ["1111111111", "3333333333"],
@@ -273,7 +342,7 @@ class TestToolsHonourTheAllowlist(unittest.TestCase):
             "customers/2222222222",
         ]
 
-        with without_allowlist():
+        with without_registry():
             self.assertEqual(
                 core.list_accessible_customers(),
                 ["1111111111", "2222222222"],

@@ -159,6 +159,56 @@
       "annotations": {
         "readOnlyHint": true
       },
+      "description": "Finds a Client in the agency's Registry and returns their Accounts.\n\nUse this before any other tool whenever the user names a Client rather than\nan account id. It is the only correct way to turn a Client's name into a\n`customer_id`: never pick an id out of `list_accessible_customers` by how\nmuch it looks like the right one.\n\nMatching ignores case, spacing and punctuation, so a Client recorded as\n`activecloud.by` is found by \"activecloud\". If several Clients match, all\nof them are returned and you must ask which one is meant rather than\nchoosing. If none match, the Client is not in the Registry: say so and ask\na Manager to add them.\n\nEach Provider maps to a *list* of account ids, usually of one. More than\none means the agency runs that Client through several cabinets \u2014 split by\ncountry or product line \u2014 and you must ask which is meant. Never query all\nof them and add the numbers up.\n\nOnly Google Ads and VK are in the Registry. For Yandex Direct, use the\nLidFly provider tools: that account context lives there, not here.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "description": "The Client's name, as the user said it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "name": "registry_find_client",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "_meta": {
+        "fastmcp": {
+          "tags": []
+        }
+      },
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "description": "Lists every Client in the agency's Registry, with their Providers.\n\nUse it when a Client cannot be found by name and you need to offer the\nManager the nearest candidates, or when they ask who is in the Registry.\nAccount ids are deliberately not included \u2014 call `find_client` for the\nClient you actually need.\n\nReturns:\n    Every Client's name and which Providers they have an Account with, any\n    problems found in the Registry, and a warning if the answer came from a\n    copy that could not be refreshed.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "registry_list_clients",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "_meta": {
+        "fastmcp": {
+          "tags": []
+        }
+      },
+      "annotations": {
+        "readOnlyHint": true
+      },
       "description": "Fetches data from the Google Ads API using the search method",
       "inputSchema": {
         "additionalProperties": false,

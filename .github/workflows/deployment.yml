@@ -128,15 +128,22 @@ jobs:
               echo "::error::В $ENV_FILE остались плейсхолдеры CHANGE_ME — заполни секреты"
               exit 1
             fi
-            # GOOGLE_ADS_ALLOWED_CUSTOMER_IDS is checked for presence, not for a value:
-            # an empty allowlist legitimately means "no restriction", but leaving the
-            # account guard off should be a decision, not an omission nobody noticed.
             for var in PORT_MCP IMAGE_TAG REDIS_PASSWORD GOOGLE_ADS_DEVELOPER_TOKEN \
-                       GOOGLE_ADS_LOGIN_CUSTOMER_ID GOOGLE_ADS_ALLOWED_CUSTOMER_IDS \
+                       GOOGLE_ADS_LOGIN_CUSTOMER_ID \
                        GOOGLE_ADS_MCP_OAUTH_CLIENT_ID GOOGLE_ADS_MCP_OAUTH_CLIENT_SECRET \
                        GOOGLE_ADS_MCP_BASE_URL GOOGLE_ADS_MCP_JWT_SIGNING_KEY; do
               if ! grep -q "^${var}=" "$ENV_FILE"; then
                 echo "::error::В $ENV_FILE отсутствует обязательная переменная ${var}"
+                exit 1
+              fi
+            done
+            # Реестр проверяется строже остальных — на непустое значение. Пустой
+            # GOOGLE_ADS_REGISTRY_SHEET_ID означает «Реестра нет», а Реестра нет —
+            # значит и allowlist'а нет: сервер отдаст любой Аккаунт, до которого
+            # дотягивается MCC. Выключить контроль доступа опечаткой нельзя.
+            for var in GOOGLE_ADS_REGISTRY_SHEET_ID GOOGLE_ADS_REGISTRY_SA_KEY; do
+              if ! grep -q "^${var}=." "$ENV_FILE"; then
+                echo "::error::В $ENV_FILE переменная ${var} отсутствует или пуста — без Реестра сервер не знает, какие Аккаунты ему разрешены (FORK.md, «Реестр Аккаунтов»)"
                 exit 1
               fi
             done
