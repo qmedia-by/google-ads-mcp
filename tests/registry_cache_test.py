@@ -23,9 +23,9 @@ from ads_mcp.registry import Client, RegistrySnapshot, RegistryUnavailable
 from ads_mcp.registry_cache import REFRESH_INTERVAL_SECONDS
 
 
-def snapshot(name="Ромашка", customer_id="1111111111", age=0.0):
+def snapshot(name="shop.by", customer_id="1111111111", age=0.0):
     return RegistrySnapshot(
-        clients=(Client(name, {"google_ads": customer_id}),),
+        clients=(Client(name, {"google_ads": (customer_id,)}),),
         problems=(),
         fetched_at=time.time() - age,
     )

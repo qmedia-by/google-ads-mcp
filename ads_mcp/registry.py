@@ -27,6 +27,14 @@ human login, so the access is granted to this deployment alone and is revoked
 by removing one viewer from the file. Nothing here writes back — the Sheet is
 edited by people.
 
+**Only two columns are ever read: Google Ads and VK.** The Sheet is a working
+document of the agency and its other columns hold credentials in plain text —
+cabinet logins next to their passwords, social accounts next to theirs. Those
+must not reach a snapshot, a cache or an agent's context, and the cheapest way
+to guarantee that is to never parse the columns they live in. Yandex Direct is
+therefore absent from the Registry by design, not by omission: the agent
+reaches Direct through LidFly, which carries its own account context.
+
 Caching and the fallback to a stale copy live in `ads_mcp.registry_cache`;
 this module only fetches and parses.
 """
@@ -36,9 +44,10 @@ import binascii
 import json
 import logging
 import os
+import re
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -58,61 +67,61 @@ _VALUES_ENDPOINT = (
 )
 _TIMEOUT_SECONDS = 20.0
 
-# Provider keys. These are the vocabulary the agent's repository already uses
-# (Провайдер / Аккаунт in its CONTEXT.md) and they travel through to the tool
-# output, so they are not spelled differently here for local convenience.
-PROVIDERS: Tuple[str, ...] = ("google_ads", "yandex_direct", "vk")
+# Provider keys, in the vocabulary the agent's repository already uses. Yandex
+# Direct is deliberately not among them — see the module docstring.
+PROVIDERS: Tuple[str, ...] = ("google_ads", "vk")
 
-# SCHEMA PENDING. The real header row has not been seen yet — the Sheet is
-# private and access is still being arranged. Headers are written by people and
-# will not match one fixed spelling, so they are matched case-, space- and
-# punctuation-insensitively against the aliases below.
+# Which column means what. Matched case-, space- and punctuation-insensitively,
+# so "VK реклама", "vk_реклама" and "ВК Реклама" are one thing. The first entry
+# in each tuple is the heading the Sheet actually uses today; the rest are room
+# for it to be renamed slightly without breaking the read.
 #
-# When the Sheet becomes readable, correcting these tuples is the whole change:
-# nothing else in this module knows what a column is called. A header that
-# matches nothing is reported, never guessed at — see `parse`.
+# A heading that matches nothing here is ignored, and a *block* with no
+# recognised provider column is skipped whole. That is how the credentials
+# columns stay unread: they are never named here, so they are never parsed.
 _NAME_ALIASES = (
-    "client",
-    "clients",
-    "name",
+    "проект",
     "клиент",
-    "клиенты",
+    "client",
+    "project",
     "название",
-    "имя",
 )
 _PROVIDER_ALIASES: Mapping[str, Tuple[str, ...]] = {
     "google_ads": (
         "google ads",
-        "google",
-        "customer id",
+        "googleads",
         "google ads id",
-        "гугл",
         "гугл адс",
     ),
-    "yandex_direct": (
-        "yandex direct",
-        "yandex",
-        "client login",
-        "яндекс директ",
-        "яндекс",
-        "директ",
-        "логин",
-    ),
     "vk": (
-        "vk",
+        "vk реклама",
+        "вк реклама",
         "vk ads",
+        "vk",
         "вк",
-        "вконтакте",
-        "vk id",
     ),
 }
+
+# A Google Ads id as people write it: `123-456-7890` in the interface,
+# `1234567890` in the API. The lookarounds keep it from biting a ten-digit
+# stretch out of a longer number — a phone number, a GA property id.
+_CUSTOMER_ID = re.compile(r"(?<![\d-])(?:\d{3}-\d{3}-\d{4}|\d{10})(?![\d-])")
+
+# VK cells are written as a human name followed by the id in brackets:
+# `SOME-NAME (12345678)` or `SOME-NAME (ID 12345678)`. Only the bracketed
+# number is taken; whatever else the cell holds stays where it is.
+_VK_ID = re.compile(r"\(\s*(?:ID\s*)?(\d{4,})\s*\)", re.IGNORECASE)
+
+# What people write in a cell to mean "none". Reporting these as malformed
+# would bury the real problems under dozens of deliberate blanks.
+_BLANK_MARKERS = frozenset({"", "-", "–", "—", "?", "нет", "н/д", "n/a"})
 
 
 class RegistryUnavailable(Exception):
     """The Registry could not be read or made sense of.
 
     Raised for every reason the answer might be missing — no configuration, a
-    rejected key, a network failure, a sheet whose header row means nothing to
+    rejected key, a network failure, a sheet whose header rows mean nothing to
     us. Callers do not act on the difference: they fall back to the last good
     snapshot either way, and the reason belongs in the log.
     """
@@ -120,19 +129,24 @@ class RegistryUnavailable(Exception):
 
 @dataclass(frozen=True)
 class Client:
-    """One Client and the Accounts the Registry gives it."""
+    """One Client and the Accounts the Registry gives it.
+
+    A Provider maps to *several* ids, not one: the Sheet legitimately splits a
+    Client across cabinets — by country, by product line — and collapsing that
+    to one id would silently pick a cabinet on the Manager's behalf.
+    """
 
     name: str
-    accounts: Mapping[str, str]
+    accounts: Mapping[str, Tuple[str, ...]]
 
 
 @dataclass(frozen=True)
 class RegistrySnapshot:
     """The Registry as it read at one moment.
 
-    `problems` carries what was wrong with the sheet — a malformed id, an
+    `problems` carries what was wrong with the sheet — an unreadable id, an
     Account claimed by two Clients. They are kept rather than raised: one bad
-    row must not cost the agent the other forty, but it must not be silent
+    row must not cost the agent the other ninety, but it must not be silent
     either, so the tools hand them to the Manager who can go and fix the Sheet.
     """
 
@@ -154,9 +168,9 @@ class RegistrySnapshot:
         working Client over a spreadsheet slip.
         """
         return frozenset(
-            client.accounts["google_ads"]
+            customer_id
             for client in self.clients
-            if "google_ads" in client.accounts
+            for customer_id in client.accounts.get("google_ads", ())
         )
 
     def find(self, name: str) -> List[Client]:
@@ -181,7 +195,8 @@ def _fold(value: str) -> str:
 
     Case, spacing and punctuation all vary between the Sheet and whatever the
     Manager says to the agent; letters and digits are what actually carry the
-    name. Unicode-aware, because half these names are in Cyrillic.
+    name. Unicode-aware, because most of these names are in Cyrillic — and it
+    is what lets `activecloud.by` be found by someone who typed `activecloud`.
     """
     return "".join(ch for ch in value.lower() if ch.isalnum())
 
@@ -350,10 +365,24 @@ def fetch() -> RegistrySnapshot:
 
 @dataclass(frozen=True)
 class _Columns:
-    """Which column holds what, resolved from the header row."""
+    """Which column holds what, resolved from one header row."""
 
     name: int
     providers: Mapping[str, int]
+
+
+@dataclass
+class _Accumulator:
+    """A Client under construction, gathering rows from every block."""
+
+    name: str
+    accounts: Dict[str, List[str]] = field(default_factory=dict)
+
+    def add(self, provider: str, ids: Sequence[str]) -> None:
+        known = self.accounts.setdefault(provider, [])
+        for value in ids:
+            if value not in known:
+                known.append(value)
 
 
 def _cell(row: Sequence[str], index: int) -> str:
@@ -363,11 +392,67 @@ def _cell(row: Sequence[str], index: int) -> str:
     return str(row[index]).strip()
 
 
-def _read_header(row: Sequence[str]) -> _Columns:
-    """Maps a candidate header row onto columns, or raises.
+def _is_blank(value: str) -> bool:
+    """True for an empty cell and for the dashes people write instead."""
+    return value.strip().strip("\\").strip().lower() in _BLANK_MARKERS
 
-    A provider column claimed twice keeps the leftmost: rereading the same
-    provider from two columns would make which Account wins depend on column
+
+def _clean_project(value: str) -> str:
+    """Normalises what the Sheet calls a project into a name to show back.
+
+    Entries are domains, and the same domain appears as `kofta.by`,
+    `https://kofta.by/` and `www.pamiar.by` in different blocks. Stripping the
+    decoration is what lets those merge into one Client instead of three.
+    """
+    name = value.strip()
+    name = re.sub(r"^https?://", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"^www\.", "", name, flags=re.IGNORECASE)
+    return name.rstrip("/").strip()
+
+
+def _extract_google_ads(cell: str) -> List[str]:
+    """Every customer id in the cell, in order, without repeats.
+
+    Cells hold more than an id: a note about which country or product line a
+    cabinet serves, an email, sometimes two cabinets side by side. The prose is
+    left alone deliberately — deciding from it which cabinet is "the right one"
+    is exactly the guess the Registry exists to prevent. All of them come back,
+    and the Manager is asked.
+    """
+    found: List[str] = []
+    for match in _CUSTOMER_ID.findall(cell):
+        normalized = normalize_customer_id(match)
+        if normalized not in found:
+            found.append(normalized)
+    return found
+
+
+def _extract_vk(cell: str) -> List[str]:
+    """Every bracketed VK id in the cell, in order, without repeats."""
+    found: List[str] = []
+    for match in _VK_ID.findall(cell):
+        if match not in found:
+            found.append(match)
+    return found
+
+
+_EXTRACTORS = {
+    "google_ads": _extract_google_ads,
+    "vk": _extract_vk,
+}
+
+
+def _read_header(row: Sequence[str]) -> Optional[_Columns]:
+    """Maps a header row onto columns.
+
+    Returns `None` for a row that is not a header at all. A row that names the
+    project column but no Provider column is a header of a block we do not
+    read — that is how the credentials blocks are recognised and skipped — and
+    it comes back as `_Columns` with no providers rather than as `None`, so the
+    caller can end the previous block instead of eating the row as data.
+
+    A Provider column claimed twice keeps the leftmost: rereading the same
+    Provider from two columns would make which Account wins depend on column
     order, and that is not a thing anyone should have to know.
     """
     name_index = -1
@@ -384,8 +469,8 @@ def _read_header(row: Sequence[str]) -> _Columns:
         if provider is not None and provider not in providers:
             providers[provider] = index
 
-    if name_index < 0 or not providers:
-        raise RegistryUnavailable("not a header row")
+    if name_index < 0:
+        return None
     return _Columns(name=name_index, providers=providers)
 
 
@@ -394,107 +479,130 @@ def parse(
 ) -> Tuple[List[Client], List[str]]:
     """Turns sheet rows into Clients, collecting what was wrong along the way.
 
+    The Sheet is not one table. Several blocks sit under one another on the
+    same tab, each with its own header and its own set of Provider columns, and
+    one Client routinely appears in more than one of them — its Google Ads
+    cabinet in the block the PPC team keeps, its VK cabinet in the block the
+    targeting team keeps. Blocks are therefore read in turn and Clients merged
+    by project name.
+
     Raises `RegistryUnavailable` when the sheet cannot be understood at all —
-    no header we recognise, or a header but no Client under it. Both mean the
-    answer is unknown, and an unknown Registry must fall back to the last good
-    snapshot rather than pass itself off as an empty one.
+    no header we recognise anywhere, or headers but no Client under any of
+    them. Both mean the answer is unknown, and an unknown Registry must fall
+    back to the last good snapshot rather than pass itself off as an empty one.
     """
     problems: List[str] = []
-    columns = None
-    header_row = 0
+    accumulators: Dict[str, _Accumulator] = {}
+    columns: Optional[_Columns] = None
+    saw_header = False
 
-    # The header is not always the first row: a hand-kept sheet often opens
-    # with a title or a note to whoever edits it.
-    for index, row in enumerate(rows):
-        try:
-            columns = _read_header(row)
-        except RegistryUnavailable:
+    for offset, row in enumerate(rows, start=1):
+        header = _read_header(row)
+        if header is not None:
+            saw_header = True
+            # A block with no Provider column among its headings is one we do
+            # not read — in this Sheet those are the ones holding cabinet and
+            # social credentials. Its rows are skipped until the next header.
+            columns = header if header.providers else None
             continue
-        header_row = index
-        break
 
-    if columns is None:
-        seen = ", ".join(
-            repr(str(cell)) for row in rows[:5] for cell in row if str(cell)
-        )
-        raise RegistryUnavailable(
-            "No header row in the Registry sheet: expected a column naming "
-            "the Client and at least one Provider column. Cells seen near the "
-            f"top: {seen or '(the sheet is empty)'}"
-        )
+        if columns is None:
+            continue
 
-    clients: List[Client] = []
-    seen_names: Dict[str, str] = {}
-    seen_accounts: Dict[Tuple[str, str], str] = {}
-
-    for offset, row in enumerate(rows[header_row + 1 :], start=header_row + 2):
-        where = f"row {offset}"
-        name = _cell(row, columns.name)
-        raw_accounts = {
+        name = _clean_project(_cell(row, columns.name))
+        cells = {
             provider: _cell(row, index)
             for provider, index in columns.providers.items()
         }
 
         if not name:
             # Blank spacer rows are normal in a sheet people edit by hand and
-            # are not worth reporting. A row with ids but no name is.
-            if any(raw_accounts.values()):
+            # are not worth reporting. A row with ids but no project is.
+            if any(not _is_blank(value) for value in cells.values()):
                 problems.append(
-                    f"{where}: Accounts listed with no Client name — skipped"
+                    f"row {offset}: Accounts listed with no project name — "
+                    f"skipped"
                 )
             continue
 
-        accounts: Dict[str, str] = {}
-        for provider, value in raw_accounts.items():
-            if not value:
+        key = _fold(name)
+        if not key:
+            continue
+
+        accumulator = accumulators.get(key)
+        if accumulator is None:
+            accumulator = _Accumulator(name=name)
+            accumulators[key] = accumulator
+
+        for provider, value in cells.items():
+            if _is_blank(value):
                 continue
-            if provider == "google_ads":
-                candidate = normalize_customer_id(value)
-                if not candidate.isdigit() or len(candidate) != 10:
-                    problems.append(
-                        f"{where}: google_ads {value!r} for {name!r} is not a "
-                        f"10-digit customer id — ignored"
-                    )
-                    continue
-                value = candidate
-            accounts[provider] = value
-
-        if not accounts:
-            problems.append(
-                f"{where}: Client {name!r} has no Accounts — skipped"
-            )
-            continue
-
-        folded_name = _fold(name)
-        if folded_name in seen_names:
-            problems.append(
-                f"{where}: {name!r} is listed twice (also as "
-                f"{seen_names[folded_name]!r}); the Registry does not say "
-                f"which row is current"
-            )
-        else:
-            seen_names[folded_name] = name
-
-        for provider, value in accounts.items():
-            key = (provider, value)
-            owner = seen_accounts.get(key)
-            if owner is not None and owner != name:
+            found = _EXTRACTORS[provider](value)
+            if not found:
                 problems.append(
-                    f"{where}: {provider} Account {value!r} is listed for both "
-                    f"{owner!r} and {name!r} — the Registry does not say which "
-                    f"Client it belongs to"
+                    f"row {offset}: no {provider} id could be read for "
+                    f"{name!r} — the cell is filled but holds nothing shaped "
+                    f"like an id"
                 )
-            else:
-                seen_accounts[key] = name
+                continue
+            accumulator.add(provider, found)
 
-        clients.append(Client(name=name, accounts=accounts))
+    if not saw_header:
+        seen = ", ".join(
+            repr(str(cell)) for row in rows[:5] for cell in row if str(cell)
+        )
+        raise RegistryUnavailable(
+            "No header row in the Registry sheet: expected a column naming "
+            "the project. Cells seen near the top: "
+            f"{seen or '(the sheet is empty)'}"
+        )
+
+    clients = [
+        Client(
+            name=accumulator.name,
+            accounts={
+                provider: tuple(ids)
+                for provider, ids in accumulator.accounts.items()
+                if ids
+            },
+        )
+        for accumulator in accumulators.values()
+    ]
+    clients = [client for client in clients if client.accounts]
 
     if not clients:
         raise RegistryUnavailable(
-            "The Registry sheet has a header row but no Client under it."
+            "The Registry sheet has header rows but no Client with a readable "
+            "Account under any of them."
         )
 
+    problems.extend(_conflicting_owners(clients))
     return clients, problems
+
+
+def _conflicting_owners(clients: Sequence[Client]) -> List[str]:
+    """Reports one Account that two different Clients both claim.
+
+    Not a rounding error: whichever way an agent broke the tie, it would be
+    reporting one Client's numbers under another's name. Nobody here is in a
+    position to decide which row is right, so both are kept and the question
+    goes back to the Manager.
+    """
+    owners: Dict[Tuple[str, str], List[str]] = {}
+    for client in clients:
+        for provider, ids in client.accounts.items():
+            for value in ids:
+                owners.setdefault((provider, value), []).append(client.name)
+
+    problems = []
+    for (provider, value), names in owners.items():
+        if len(names) > 1:
+            listed = ", ".join(repr(name) for name in sorted(names))
+            problems.append(
+                f"{provider} Account {value!r} is listed for {listed} — the "
+                f"Registry does not say which Client it belongs to"
+            )
+    return problems
 
 
 def snapshot_to_json(snapshot: RegistrySnapshot) -> str:
@@ -504,7 +612,13 @@ def snapshot_to_json(snapshot: RegistrySnapshot) -> str:
             "fetched_at": snapshot.fetched_at,
             "problems": list(snapshot.problems),
             "clients": [
-                {"name": client.name, "accounts": dict(client.accounts)}
+                {
+                    "name": client.name,
+                    "accounts": {
+                        provider: list(ids)
+                        for provider, ids in client.accounts.items()
+                    },
+                }
                 for client in snapshot.clients
             ],
         },
@@ -526,8 +640,8 @@ def snapshot_from_json(raw: str) -> RegistrySnapshot:
                 Client(
                     name=str(entry["name"]),
                     accounts={
-                        str(k): str(v)
-                        for k, v in dict(entry["accounts"]).items()
+                        str(provider): tuple(str(v) for v in ids)
+                        for provider, ids in dict(entry["accounts"]).items()
                     },
                 )
                 for entry in payload["clients"]

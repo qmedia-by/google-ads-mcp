@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Test cases for reading the Account Registry (fork addition)."""
+"""Test cases for reading the Account Registry (fork addition).
+
+The rows here are shaped like the agency's real sheet — several blocks with
+different columns, domains for names, ids written with hyphens and prose around
+them — with invented values.
+"""
 
 import base64
 import json
@@ -22,22 +27,26 @@ from unittest.mock import MagicMock, patch
 
 from ads_mcp import registry
 from ads_mcp.registry import (
+    SERVICE_ACCOUNT_KEY_ENV_VAR,
+    SHEET_ID_ENV_VAR,
     Client,
     RegistrySnapshot,
     RegistryUnavailable,
-    SERVICE_ACCOUNT_KEY_ENV_VAR,
-    SHEET_ID_ENV_VAR,
     is_configured,
     normalize_customer_id,
     parse,
 )
 
-HEADER = ["Клиент", "Google Ads", "Yandex Direct", "VK"]
+# The PPC block: the one that carries Google Ads.
+PPC_HEADER = ["Проект", "ТС PPC", "Яндекс Директ", "Google Ads", "VK реклама"]
+# The targeting block: same projects, different Providers, no Google Ads.
+TARGET_HEADER = ["Проект", "ТС Target", "Meta", "TikTok", "VK реклама"]
+# The credentials block: named columns we never read.
+ACCESS_HEADER = ["Проект", "ТС", "Аккаунт", "Доступы"]
 
 
-def sheet(*rows):
-    """A sheet with the usual header and the rows given."""
-    return [HEADER, *rows]
+def ppc(*rows):
+    return [PPC_HEADER, *rows]
 
 
 class TestNormalizeCustomerId(unittest.TestCase):
@@ -67,47 +76,118 @@ class TestIsConfigured(unittest.TestCase):
             self.assertFalse(is_configured())
 
 
-class TestParseHeader(unittest.TestCase):
-    def test_reads_a_plain_sheet(self):
+class TestCredentialColumnsAreNeverRead(unittest.TestCase):
+    """The Sheet holds cabinet and social passwords in plain text.
+
+    They are kept out by never naming those columns, so these are the tests
+    that matter most in this file: if they fail, secrets are on their way into
+    a snapshot, a Redis key and an agent's context.
+    """
+
+    def test_the_yandex_direct_column_does_not_reach_the_output(self):
+        secret = "cabinet-login SuperSecret123"
         clients, problems = parse(
-            sheet(["Ромашка", "123-456-7890", "romashka", "42"])
+            ppc(["shop.by", "Иванов", secret, "123-456-7890", ""])
+        )
+
+        self.assertNotIn("yandex_direct", clients[0].accounts)
+        rendered = repr(clients) + repr(problems)
+        self.assertNotIn("SuperSecret123", rendered)
+        self.assertNotIn("cabinet-login", rendered)
+
+    def test_a_block_with_no_provider_columns_is_skipped_whole(self):
+        rows = [
+            *ppc(["shop.by", "Иванов", "", "123-456-7890", ""]),
+            [],
+            ACCESS_HEADER,
+            ["shop.by", "Петров", "instagram.com/shop", "pass: hunter2"],
+        ]
+        clients, problems = parse(rows)
+
+        self.assertEqual([c.name for c in clients], ["shop.by"])
+        rendered = repr(clients) + repr(problems)
+        self.assertNotIn("hunter2", rendered)
+        self.assertNotIn("instagram", rendered)
+
+    def test_the_credentials_header_does_not_become_a_client(self):
+        # Without the block-boundary handling, "Проект" itself would be read
+        # as a project name and its row as data.
+        rows = [
+            *ppc(["shop.by", "Иванов", "", "123-456-7890", ""]),
+            ACCESS_HEADER,
+            ["other.by", "Петров", "account", "pass: hunter2"],
+        ]
+        clients, _ = parse(rows)
+
+        names = [c.name for c in clients]
+        self.assertEqual(names, ["shop.by"])
+        self.assertNotIn("Проект", names)
+
+
+class TestBlocks(unittest.TestCase):
+    def test_reads_a_single_block(self):
+        clients, problems = parse(
+            ppc(["shop.by", "Иванов", "", "123-456-7890", "SHOP (19142062)"])
         )
 
         self.assertEqual(problems, [])
         self.assertEqual(len(clients), 1)
-        self.assertEqual(clients[0].name, "Ромашка")
+        self.assertEqual(clients[0].name, "shop.by")
         self.assertEqual(
             clients[0].accounts,
-            {
-                "google_ads": "1234567890",
-                "yandex_direct": "romashka",
-                "vk": "42",
-            },
+            {"google_ads": ("1234567890",), "vk": ("19142062",)},
         )
 
     def test_finds_a_header_that_is_not_the_first_row(self):
-        # Sheets people keep by hand usually open with a title or a note.
         rows = [
             ["Реестр аккаунтов — не редактировать без согласования"],
             [],
-            HEADER,
-            ["Ромашка", "1234567890", "", ""],
+            *ppc(["shop.by", "Иванов", "", "123-456-7890", ""]),
         ]
         clients, _ = parse(rows)
-        self.assertEqual([c.name for c in clients], ["Ромашка"])
+        self.assertEqual([c.name for c in clients], ["shop.by"])
 
-    def test_header_matching_ignores_case_spacing_and_punctuation(self):
+    def test_merges_one_client_split_across_blocks(self):
+        # The PPC team and the targeting team keep separate blocks, and the
+        # same Client appears in both with different Providers.
         rows = [
-            ["  КЛИЕНТ ", "google_ads", "Яндекс.Директ", "VK Ads"],
-            ["Ромашка", "1234567890", "romashka", "42"],
+            *ppc(["shop.by", "Иванов", "", "123-456-7890", ""]),
+            [],
+            TARGET_HEADER,
+            ["shop.by", "Петрова", "META (ID 555)", "TT", "SHOP (19142062)"],
         ]
         clients, _ = parse(rows)
+
+        self.assertEqual(len(clients), 1)
         self.assertEqual(
-            sorted(clients[0].accounts),
-            ["google_ads", "vk", "yandex_direct"],
+            clients[0].accounts,
+            {"google_ads": ("1234567890",), "vk": ("19142062",)},
         )
 
-    def test_a_sheet_with_no_recognisable_header_is_unavailable(self):
+    def test_ignores_providers_that_are_not_ours(self):
+        # Meta and TikTok are in the Sheet and not connected to the agent.
+        rows = [
+            TARGET_HEADER,
+            ["shop.by", "Петрова", "META (ID 555)", "TT", ""],
+        ]
+        with self.assertRaises(RegistryUnavailable):
+            parse(rows)
+
+    def test_a_second_block_does_not_inherit_the_first_columns(self):
+        rows = [
+            *ppc(["shop.by", "Иванов", "", "123-456-7890", ""]),
+            TARGET_HEADER,
+            # Column 3 is TikTok here, not Google Ads. Reading it as an id
+            # would invent an Account nobody has.
+            ["other.by", "Петрова", "META (ID 5)", "999-888-7777", ""],
+        ]
+        clients, _ = parse(rows)
+
+        by_name = {c.name: c.accounts for c in clients}
+        self.assertNotIn("other.by", by_name)
+        self.assertEqual(by_name["shop.by"]["google_ads"], ("1234567890",))
+
+    def test_no_header_anywhere_is_unavailable(self):
         # Not an empty Registry: an empty Registry is an empty allowlist, and
         # that would lock every Manager out over a renamed column.
         with self.assertRaises(RegistryUnavailable):
@@ -119,86 +199,188 @@ class TestParseHeader(unittest.TestCase):
 
         self.assertIn("Заказчик", str(context.exception))
 
-    def test_a_header_with_no_clients_under_it_is_unavailable(self):
+    def test_headers_but_no_readable_client_is_unavailable(self):
         with self.assertRaises(RegistryUnavailable):
-            parse(sheet())
+            parse(ppc())
 
     def test_an_empty_sheet_is_unavailable(self):
         with self.assertRaises(RegistryUnavailable):
             parse([])
 
-    def test_a_repeated_provider_column_keeps_the_leftmost(self):
-        rows = [
-            ["Клиент", "Google Ads", "Google"],
-            ["Ромашка", "1111111111", "2222222222"],
-        ]
+
+class TestProjectNames(unittest.TestCase):
+    def test_strips_scheme_www_and_trailing_slash(self):
+        rows = ppc(
+            ["https://shop.by/", "И", "", "111-111-1111", ""],
+            ["www.other.by", "И", "", "222-222-2222", ""],
+        )
         clients, _ = parse(rows)
-        self.assertEqual(clients[0].accounts["google_ads"], "1111111111")
+        self.assertEqual([c.name for c in clients], ["shop.by", "other.by"])
+
+    def test_the_same_domain_written_three_ways_is_one_client(self):
+        rows = ppc(
+            ["shop.by", "И", "", "111-111-1111", ""],
+            ["https://shop.by/", "И", "", "222-222-2222", ""],
+            ["www.shop.by", "И", "", "", "SHOP (19142062)"],
+        )
+        clients, _ = parse(rows)
+
+        self.assertEqual(len(clients), 1)
+        self.assertEqual(
+            clients[0].accounts["google_ads"], ("1111111111", "2222222222")
+        )
+        self.assertEqual(clients[0].accounts["vk"], ("19142062",))
+
+    def test_keeps_the_first_spelling_as_the_display_name(self):
+        rows = ppc(
+            ["shop.by", "И", "", "111-111-1111", ""],
+            ["https://shop.by/", "И", "", "222-222-2222", ""],
+        )
+        clients, _ = parse(rows)
+        self.assertEqual(clients[0].name, "shop.by")
 
 
-class TestParseRows(unittest.TestCase):
-    def test_tolerates_rows_the_api_truncated(self):
-        # The Sheets API drops trailing empty cells rather than padding them.
-        clients, problems = parse(sheet(["Ромашка", "1234567890"]))
-        self.assertEqual(problems, [])
-        self.assertEqual(clients[0].accounts, {"google_ads": "1234567890"})
+class TestGoogleAdsCells(unittest.TestCase):
+    def test_reads_a_hyphenated_id(self):
+        clients, _ = parse(ppc(["shop.by", "И", "", "846-647-7739", ""]))
+        self.assertEqual(clients[0].accounts["google_ads"], ("8466477739",))
 
-    def test_ignores_blank_spacer_rows_without_complaining(self):
-        clients, problems = parse(
-            sheet(["Ромашка", "1234567890"], [], ["", "", "", ""])
+    def test_reads_a_bare_ten_digit_id(self):
+        clients, _ = parse(ppc(["shop.by", "И", "", "8466477739", ""]))
+        self.assertEqual(clients[0].accounts["google_ads"], ("8466477739",))
+
+    def test_takes_every_cabinet_in_a_cell_rather_than_the_first(self):
+        # Written in the Sheet as prose: several cabinets split by country or
+        # product line. Picking one would report on half a Client.
+        cell = "разные кабинеты: 814-201-8417 666-118-9500"
+        clients, problems = parse(ppc(["shop.by", "И", "", cell, ""]))
+
+        self.assertEqual(
+            clients[0].accounts["google_ads"], ("8142018417", "6661189500")
         )
         self.assertEqual(problems, [])
-        self.assertEqual(len(clients), 1)
 
-    def test_reports_accounts_with_no_client_name(self):
+    def test_ignores_prose_around_an_id(self):
+        cell = "byqmedia@gmail.com 700-817-1195"
+        clients, _ = parse(ppc(["shop.by", "И", "", cell, ""]))
+        self.assertEqual(clients[0].accounts["google_ads"], ("7008171195",))
+
+    def test_does_not_bite_ten_digits_out_of_a_longer_number(self):
+        # A phone number in the cell is not a cabinet.
+        cell = "вход по телефону +375291990147"
         clients, problems = parse(
-            sheet(["Ромашка", "1111111111"], ["", "2222222222"])
+            ppc(
+                ["other.by", "И", "", "111-111-1111", ""],
+                ["shop.by", "И", "", cell, ""],
+            )
+        )
+
+        self.assertEqual([c.name for c in clients], ["other.by"])
+        self.assertTrue(any("no google_ads id" in p for p in problems))
+
+    def test_a_repeated_id_in_one_cell_is_listed_once(self):
+        cell = "846-647-7739 и он же 8466477739"
+        clients, _ = parse(ppc(["shop.by", "И", "", cell, ""]))
+        self.assertEqual(clients[0].accounts["google_ads"], ("8466477739",))
+
+    def test_dashes_meaning_none_are_not_reported_as_broken(self):
+        for marker in ("-", "–", "—", "\\-", ""):
+            with self.subTest(marker=marker):
+                rows = ppc(
+                    ["shop.by", "И", "", marker, "SHOP (19142062)"],
+                )
+                clients, problems = parse(rows)
+                self.assertEqual(problems, [])
+                self.assertNotIn("google_ads", clients[0].accounts)
+
+    def test_a_filled_cell_with_nothing_id_shaped_is_reported(self):
+        clients, problems = parse(
+            ppc(["shop.by", "И", "", "уточняется у клиента", "SHOP (1914)"])
+        )
+        self.assertEqual(len(problems), 1)
+        self.assertIn("no google_ads id", problems[0])
+        self.assertIn("shop.by", problems[0])
+
+
+class TestVkCells(unittest.TestCase):
+    def test_reads_a_bracketed_id(self):
+        clients, _ = parse(
+            ppc(["shop.by", "И", "", "", "ICNT-ВКа-M-S-shop (19142062)"])
+        )
+        self.assertEqual(clients[0].accounts["vk"], ("19142062",))
+
+    def test_reads_a_bracketed_id_written_with_the_word_id(self):
+        clients, _ = parse(
+            ppc(["shop.by", "И", "", "", "SHOP-NAME (ID 29165115)"])
+        )
+        self.assertEqual(clients[0].accounts["vk"], ("29165115",))
+
+    def test_takes_only_the_bracketed_number(self):
+        # These cells also carry logins and phone numbers. Only what is in
+        # brackets is an account id, and only that leaves the parser.
+        cell = "vkads_1095379146@vk@11083283 (ID 29165115) вход +375291990147"
+        clients, problems = parse(ppc(["shop.by", "И", "", "", cell]))
+
+        self.assertEqual(clients[0].accounts["vk"], ("29165115",))
+        rendered = repr(clients) + repr(problems)
+        self.assertNotIn("1095379146", rendered)
+        self.assertNotIn("375291990147", rendered)
+
+
+class TestProblems(unittest.TestCase):
+    def test_reports_accounts_with_no_project_name(self):
+        clients, problems = parse(
+            ppc(
+                ["shop.by", "И", "", "111-111-1111", ""],
+                ["", "", "", "2" * 10, ""],
+            )
         )
         self.assertEqual(len(clients), 1)
         self.assertEqual(len(problems), 1)
-        self.assertIn("no Client name", problems[0])
+        self.assertIn("no project name", problems[0])
 
-    def test_reports_a_client_with_no_accounts_at_all(self):
+    def test_ignores_blank_spacer_rows_without_complaining(self):
         clients, problems = parse(
-            sheet(["Ромашка", "1111111111"], ["Пустышка", "", "", ""])
+            ppc(
+                ["shop.by", "И", "", "111-111-1111", ""],
+                [],
+                ["", "", "", "", ""],
+            )
         )
-        self.assertEqual([c.name for c in clients], ["Ромашка"])
-        self.assertIn("no Accounts", problems[0])
+        self.assertEqual(problems, [])
+        self.assertEqual(len(clients), 1)
 
-    def test_a_malformed_customer_id_is_dropped_not_guessed_at(self):
-        clients, problems = parse(sheet(["Ромашка", "12345", "romashka", ""]))
-        self.assertNotIn("google_ads", clients[0].accounts)
-        self.assertEqual(clients[0].accounts, {"yandex_direct": "romashka"})
-        self.assertIn("10-digit", problems[0])
-
-    def test_a_malformed_id_does_not_cost_the_client_its_other_accounts(self):
-        clients, _ = parse(sheet(["Ромашка", "нет", "romashka", "42"]))
-        self.assertEqual(sorted(clients[0].accounts), ["vk", "yandex_direct"])
-
-    def test_reports_a_client_listed_twice(self):
-        clients, problems = parse(
-            sheet(["Ромашка", "1111111111"], ["ромашка ", "2222222222"])
+    def test_a_project_with_no_readable_account_is_left_out(self):
+        clients, _ = parse(
+            ppc(
+                ["shop.by", "И", "", "111-111-1111", ""],
+                ["empty.by", "И", "", "-", "-"],
+            )
         )
-        # Both rows are kept: which one is current is not ours to decide.
-        self.assertEqual(len(clients), 2)
-        self.assertTrue(any("listed twice" in p for p in problems))
+        self.assertEqual([c.name for c in clients], ["shop.by"])
 
     def test_reports_one_account_claimed_by_two_clients(self):
         clients, problems = parse(
-            sheet(["Ромашка", "1111111111"], ["Лютик", "1111111111"])
+            ppc(
+                ["shop.by", "И", "", "111-111-1111", ""],
+                ["other.by", "И", "", "111-111-1111", ""],
+            )
         )
         self.assertEqual(len(clients), 2)
-        self.assertTrue(any("does not say which Client" in p for p in problems))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("does not say which Client", problems[0])
+        self.assertIn("shop.by", problems[0])
+        self.assertIn("other.by", problems[0])
 
-    def test_the_same_account_on_one_client_twice_is_not_a_conflict(self):
-        # Two rows for one Client is a duplicate name, reported once — it is
-        # not also an ownership conflict with itself.
-        _, problems = parse(
-            sheet(["Ромашка", "1111111111"], ["Ромашка", "1111111111"])
+    def test_several_cabinets_on_one_client_are_not_a_conflict(self):
+        clients, problems = parse(
+            ppc(
+                ["shop.by", "И", "", "111-111-1111", ""],
+                ["shop.by", "И", "", "222-222-2222", ""],
+            )
         )
-        self.assertFalse(
-            any("does not say which Client" in p for p in problems)
-        )
+        self.assertEqual(len(clients), 1)
+        self.assertEqual(problems, [])
 
 
 class TestSnapshot(unittest.TestCase):
@@ -209,21 +391,22 @@ class TestSnapshot(unittest.TestCase):
             fetched_at=time.time() - age,
         )
 
-    def test_allowed_customer_ids_collects_google_ads_only(self):
+    def test_allowed_customer_ids_collects_every_cabinet(self):
         snapshot = self.snapshot(
-            Client("Ромашка", {"google_ads": "1111111111", "vk": "42"}),
-            Client("Лютик", {"yandex_direct": "lutik"}),
+            Client("shop.by", {"google_ads": ("1111111111", "3333333333")}),
+            Client("other.by", {"vk": ("42",)}),
         )
         self.assertEqual(
-            snapshot.allowed_customer_ids(), frozenset({"1111111111"})
+            snapshot.allowed_customer_ids(),
+            frozenset({"1111111111", "3333333333"}),
         )
 
     def test_a_contested_account_stays_in_the_allowlist(self):
         # The duplicate makes the attribution ambiguous, not the account fake.
         # Refusing it would break a working Client over a spreadsheet slip.
         snapshot = self.snapshot(
-            Client("Ромашка", {"google_ads": "1111111111"}),
-            Client("Лютик", {"google_ads": "1111111111"}),
+            Client("shop.by", {"google_ads": ("1111111111",)}),
+            Client("other.by", {"google_ads": ("1111111111",)}),
         )
         self.assertEqual(
             snapshot.allowed_customer_ids(), frozenset({"1111111111"})
@@ -231,39 +414,39 @@ class TestSnapshot(unittest.TestCase):
 
     def test_find_matches_exactly_first(self):
         snapshot = self.snapshot(
-            Client("Ромашка", {"vk": "1"}),
-            Client("Ромашка Плюс", {"vk": "2"}),
+            Client("shop.by", {"vk": ("1",)}),
+            Client("shop.by.plus", {"vk": ("2",)}),
         )
         self.assertEqual(
-            [c.name for c in snapshot.find("ромашка")], ["Ромашка"]
+            [c.name for c in snapshot.find("shop.by")], ["shop.by"]
         )
 
     def test_find_falls_back_to_containment(self):
         snapshot = self.snapshot(
-            Client("Ромашка Плюс", {"vk": "1"}),
-            Client("Лютик", {"vk": "2"}),
+            Client("activecloud.by", {"vk": ("1",)}),
+            Client("other.by", {"vk": ("2",)}),
         )
         self.assertEqual(
-            [c.name for c in snapshot.find("ромашка")], ["Ромашка Плюс"]
+            [c.name for c in snapshot.find("activecloud")], ["activecloud.by"]
         )
 
     def test_find_ignores_spacing_and_punctuation(self):
-        snapshot = self.snapshot(Client('ООО "Ромашка"', {"vk": "1"}))
-        self.assertEqual(len(snapshot.find("ооо ромашка")), 1)
+        snapshot = self.snapshot(Client("овертайм.бел", {"vk": ("1",)}))
+        self.assertEqual(len(snapshot.find("овертайм бел")), 1)
 
     def test_find_returns_every_candidate_rather_than_the_best(self):
         snapshot = self.snapshot(
-            Client("Ромашка Север", {"vk": "1"}),
-            Client("Ромашка Юг", {"vk": "2"}),
+            Client("shop.by", {"vk": ("1",)}),
+            Client("shop.ru", {"vk": ("2",)}),
         )
-        self.assertEqual(len(snapshot.find("ромашка")), 2)
+        self.assertEqual(len(snapshot.find("shop")), 2)
 
     def test_find_on_nothing_matches_nothing(self):
-        snapshot = self.snapshot(Client("Ромашка", {"vk": "1"}))
+        snapshot = self.snapshot(Client("shop.by", {"vk": ("1",)}))
         self.assertEqual(snapshot.find("   "), [])
 
     def test_age_is_never_negative(self):
-        snapshot = self.snapshot(Client("Ромашка", {"vk": "1"}), age=-60)
+        snapshot = self.snapshot(Client("shop.by", {"vk": ("1",)}), age=-60)
         self.assertEqual(snapshot.age_seconds, 0.0)
 
 
@@ -271,7 +454,10 @@ class TestSnapshotSerialisation(unittest.TestCase):
     def test_round_trips(self):
         original = RegistrySnapshot(
             clients=(
-                Client("Ромашка", {"google_ads": "1111111111", "vk": "42"}),
+                Client(
+                    "shop.by",
+                    {"google_ads": ("1111111111", "2222222222"), "vk": ("42",)},
+                ),
             ),
             problems=("row 4: something",),
             fetched_at=1234567.5,
@@ -353,15 +539,15 @@ class TestFetch(unittest.TestCase):
         self.assertIn(SHEET_ID_ENV_VAR, str(context.exception))
 
     def test_parses_a_successful_response(self):
-        rows = sheet(["Ромашка", "1234567890", "", ""])
+        rows = ppc(["shop.by", "И", "", "123-456-7890", ""])
         with self.respond(payload={"values": rows}):
             snapshot = registry.fetch()
 
-        self.assertEqual([c.name for c in snapshot.clients], ["Ромашка"])
+        self.assertEqual([c.name for c in snapshot.clients], ["shop.by"])
         self.assertAlmostEqual(snapshot.age_seconds, 0.0, places=1)
 
     def test_sends_a_bearer_token_and_never_the_key(self):
-        rows = sheet(["Ромашка", "1234567890"])
+        rows = ppc(["shop.by", "И", "", "123-456-7890", ""])
         with self.respond(payload={"values": rows}) as mock_get:
             registry.fetch()
 

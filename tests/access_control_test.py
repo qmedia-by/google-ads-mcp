@@ -37,7 +37,7 @@ def snapshot_of(*customer_ids: str, age: float = 0.0) -> RegistrySnapshot:
     """A Registry holding one Client per id given."""
     return RegistrySnapshot(
         clients=tuple(
-            Client(name=f"Client {number}", accounts={"google_ads": cid})
+            Client(name=f"client-{number}.by", accounts={"google_ads": (cid,)})
             for number, cid in enumerate(customer_ids, start=1)
         ),
         problems=(),
@@ -89,8 +89,8 @@ class TestGetAllowedCustomerIds(unittest.TestCase):
     def test_ignores_clients_without_a_google_ads_account(self):
         snapshot = RegistrySnapshot(
             clients=(
-                Client(name="Ads", accounts={"google_ads": "1234567890"}),
-                Client(name="Direct only", accounts={"yandex_direct": "acme"}),
+                Client(name="ads.by", accounts={"google_ads": ("1234567890",)}),
+                Client(name="vk-only.by", accounts={"vk": ("42",)}),
             ),
             problems=(),
             fetched_at=time.time(),
@@ -98,6 +98,23 @@ class TestGetAllowedCustomerIds(unittest.TestCase):
         with with_registry(snapshot):
             self.assertEqual(
                 get_allowed_customer_ids(), frozenset({"1234567890"})
+            )
+
+    def test_collects_every_cabinet_of_a_client_with_several(self):
+        snapshot = RegistrySnapshot(
+            clients=(
+                Client(
+                    name="split.by",
+                    accounts={"google_ads": ("1111111111", "2222222222")},
+                ),
+            ),
+            problems=(),
+            fetched_at=time.time(),
+        )
+        with with_registry(snapshot):
+            self.assertEqual(
+                get_allowed_customer_ids(),
+                frozenset({"1111111111", "2222222222"}),
             )
 
     def test_unreadable_registry_refuses_rather_than_permits(self):
@@ -109,7 +126,7 @@ class TestGetAllowedCustomerIds(unittest.TestCase):
 
     def test_registry_without_any_google_ads_accounts_allows_nothing(self):
         snapshot = RegistrySnapshot(
-            clients=(Client(name="Direct only", accounts={"vk": "42"}),),
+            clients=(Client(name="vk-only.by", accounts={"vk": ("42",)}),),
             problems=(),
             fetched_at=time.time(),
         )
@@ -153,7 +170,7 @@ class TestEnsureCustomerIdAllowed(unittest.TestCase):
         self,
     ):
         snapshot = RegistrySnapshot(
-            clients=(Client(name="Direct only", accounts={"vk": "42"}),),
+            clients=(Client(name="vk-only.by", accounts={"vk": ("42",)}),),
             problems=(),
             fetched_at=time.time(),
         )

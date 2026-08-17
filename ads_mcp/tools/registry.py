@@ -109,7 +109,29 @@ def _snapshot(*, force_refresh: bool = False) -> RegistrySnapshot:
 
 
 def _render(client: Client) -> Dict[str, Any]:
-    return {"name": client.name, "accounts": dict(client.accounts)}
+    return {
+        "name": client.name,
+        "accounts": {
+            provider: list(ids) for provider, ids in client.accounts.items()
+        },
+    }
+
+
+def _providers_with_several(clients: Sequence[Client]) -> List[str]:
+    """Providers where a returned Client has more than one Account.
+
+    Normal rather than broken: the agency splits a Client across cabinets by
+    country or product line. It still has to be asked about, because picking
+    one silently means reporting on half a Client.
+    """
+    return sorted(
+        {
+            provider
+            for client in clients
+            for provider, ids in client.accounts.items()
+            if len(ids) > 1
+        }
+    )
 
 
 @registry_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -121,10 +143,19 @@ def find_client(name: str) -> Dict[str, Any]:
     `customer_id`: never pick an id out of `list_accessible_customers` by how
     much it looks like the right one.
 
-    Matching ignores case, spacing and punctuation. If several Clients match,
-    all of them are returned and you must ask which one is meant rather than
+    Matching ignores case, spacing and punctuation, so a Client recorded as
+    `activecloud.by` is found by "activecloud". If several Clients match, all
+    of them are returned and you must ask which one is meant rather than
     choosing. If none match, the Client is not in the Registry: say so and ask
     a Manager to add them.
+
+    Each Provider maps to a *list* of account ids, usually of one. More than
+    one means the agency runs that Client through several cabinets — split by
+    country or product line — and you must ask which is meant. Never query all
+    of them and add the numbers up.
+
+    Only Google Ads and VK are in the Registry. For Yandex Direct, use the
+    LidFly provider tools: that account context lives there, not here.
 
     Args:
         name: The Client's name, as the user said it.
@@ -162,10 +193,20 @@ def find_client(name: str) -> Dict[str, Any]:
         problems = _problems_about(snapshot, matches)
         if problems:
             result["problems"] = problems
+
+        several = _providers_with_several(matches)
         if len(matches) > 1:
             result["guidance"] = (
                 "Several Clients match. Ask the Manager which one is meant "
                 "before querying anything."
+            )
+        elif several:
+            result["guidance"] = (
+                f"This Client has more than one Account for: "
+                f"{', '.join(several)}. The agency splits Clients across "
+                f"cabinets by country or product line, so ask the Manager "
+                f"which one they mean rather than picking one or merging the "
+                f"numbers."
             )
 
     warning = _staleness(snapshot)
