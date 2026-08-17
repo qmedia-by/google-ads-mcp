@@ -18,111 +18,105 @@ Fork addition, see FORK.md. Upstream enforces no such limit: whoever
 authenticates can query every account the configured MCC reaches, so one
 mistyped `customer_id` is enough to pull another client's numbers.
 
-`GOOGLE_ADS_ALLOWED_CUSTOMER_IDS` — customer ids separated by commas —
-narrows that to the accounts named in it. Unset or empty means unrestricted,
-which is upstream's behaviour and keeps the same image usable without the
-variable.
+The allowlist is **the Registry** (`ads_mcp.registry`) — the accounts named in
+the agency's Sheet are the accounts this server will serve, and nothing else.
+It used to be a separate `GOOGLE_ADS_ALLOWED_CUSTOMER_IDS` variable copied out
+of the Registry by hand, which meant connecting a Client was two operations in
+two places and the pair drifted; the symptom was a refusal for an Account the
+Registry already listed. One source removes the class of problem rather than
+the instance.
+
+A deployment with no Registry configured is unrestricted. That is upstream's
+behaviour, and it keeps the same image runnable locally without a service
+account. A deployment that has a Registry it cannot read is *not* unrestricted:
+it refuses, because an unknown allowlist is not an empty one.
 """
 
 import logging
-import os
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 from fastmcp.exceptions import ToolError
 
+from ads_mcp import registry, registry_cache
+from ads_mcp.registry import normalize_customer_id
+
 logger = logging.getLogger(__name__)
 
-ALLOWED_CUSTOMER_IDS_ENV_VAR = "GOOGLE_ADS_ALLOWED_CUSTOMER_IDS"
+# What to tell the caller when the Registry is configured but unreadable. The
+# caller cannot fix it by picking a different account, so the message points at
+# the one person who can do something about it.
+_UNAVAILABLE = (
+    "The Registry could not be read, so this server cannot tell which Accounts "
+    "it is allowed to query, and it will not guess. This is for whoever "
+    "administers the server to fix — check that the Registry sheet is still "
+    "shared with the server's service account. See the server log for the "
+    "underlying error."
+)
 
 
-def _normalize(customer_id: str) -> str:
-    """Reduces an id to the bare digits the API and the allowlist agree on.
+def get_allowed_customer_ids() -> Optional[frozenset]:
+    """Returns the allowed account ids, or None when unrestricted.
 
-    Accounts are written both ways in practice — `123-456-7890` in the Google
-    Ads UI, `1234567890` in the API — and a manager pasting the hyphenated
-    form must not be refused over punctuation.
+    Raises `ToolError` when a Registry is configured but no copy of it can be
+    had — not even a stale one. Reading it costs a dictionary lookup in the
+    common case: `registry_cache` holds the snapshot in process memory and only
+    reaches for the network when it has gone stale.
     """
-    return "".join(str(customer_id).split()).replace("-", "")
-
-
-def _parse(raw: str) -> frozenset[str]:
-    """Reads the env var, dropping entries that cannot be an account id."""
-    allowed = set()
-    for entry in raw.split(","):
-        candidate = _normalize(entry)
-        if not candidate:
-            continue
-        if not candidate.isdigit():
-            logger.warning(
-                "Ignoring '%s' in %s: a customer id is digits only.",
-                entry.strip(),
-                ALLOWED_CUSTOMER_IDS_ENV_VAR,
-            )
-            continue
-        allowed.add(candidate)
-    return frozenset(allowed)
-
-
-def get_allowed_customer_ids() -> frozenset[str] | None:
-    """Returns the configured allowlist, or None when unrestricted.
-
-    Read on every call rather than cached at import: it costs a dictionary
-    lookup next to a network round trip, and it keeps the variable
-    straightforward to patch in tests.
-    """
-    raw = os.environ.get(ALLOWED_CUSTOMER_IDS_ENV_VAR, "")
-    if not raw.strip():
+    if not registry.is_configured():
         return None
-    return _parse(raw)
+
+    snapshot = registry_cache.get_snapshot()
+    if snapshot is None:
+        raise ToolError(_UNAVAILABLE)
+
+    return snapshot.allowed_customer_ids()
 
 
 def ensure_customer_id_allowed(customer_id: str) -> None:
-    """Raises ToolError unless the allowlist permits `customer_id`.
+    """Raises ToolError unless the Registry names `customer_id`.
 
     Call it before doing any work for an account: there is no reason to
     authenticate against Google for a request that is going to be refused.
     """
     allowed = get_allowed_customer_ids()
-    if allowed is None or _normalize(customer_id) in allowed:
+    if allowed is None or normalize_customer_id(customer_id) in allowed:
         return
 
-    # Set but unusable. Every account is blocked, and no id the caller could
-    # pick instead would help — this one is for the administrator to fix.
+    # A Registry that names no Google Ads account at all. Every account is
+    # blocked and no id the caller could pick instead would help, so this one
+    # is for the administrator rather than the Manager.
     if not allowed:
         raise ToolError(
-            f"Account {customer_id} was refused: this server's "
-            f"{ALLOWED_CUSTOMER_IDS_ENV_VAR} is set but names no valid "
-            f"customer id, so no account can be queried at all. Report this "
+            f"Account {customer_id} was refused: the Registry lists no Google "
+            f"Ads Accounts at all, so no Account can be queried. Report this "
             f"to whoever administers the server."
         )
 
     raise ToolError(
-        f"Account {customer_id} is not in this server's list of allowed "
-        f"accounts, so it cannot be queried. Allowed accounts: "
-        f"{', '.join(sorted(allowed))}. Use one of those, or ask an "
-        f"administrator to add {customer_id} to "
-        f"{ALLOWED_CUSTOMER_IDS_ENV_VAR}."
+        f"Account {customer_id} is not in this agency's Registry, so it "
+        f"cannot be queried. Either the Client is missing from the Registry — "
+        f"ask a Manager to add it — or the id is a typo. Accounts in the "
+        f"Registry: {', '.join(sorted(allowed))}."
     )
 
 
 def filter_allowed_customer_ids(customer_ids: Iterable[str]) -> List[str]:
     """Keeps only the allowed ids, in the order they arrived.
 
-    Discovery filters instead of refusing: an account the caller may not
-    query has no business being offered as a choice in the first place.
+    Discovery filters instead of refusing: an account the caller may not query
+    has no business being offered as a choice in the first place.
     """
     allowed = get_allowed_customer_ids()
     if allowed is None:
         return list(customer_ids)
 
     accessible = list(customer_ids)
-    kept = [cid for cid in accessible if _normalize(cid) in allowed]
+    kept = [cid for cid in accessible if normalize_customer_id(cid) in allowed]
 
     hidden = len(accessible) - len(kept)
     if hidden:
         logger.info(
-            "%s hid %d of %d accessible accounts.",
-            ALLOWED_CUSTOMER_IDS_ENV_VAR,
+            "The Registry hid %d of %d accessible accounts.",
             hidden,
             len(accessible),
         )
