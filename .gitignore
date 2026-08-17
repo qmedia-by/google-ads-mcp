@@ -39,3 +39,14 @@ coverage.xml
 .nox/
 # local dev venv
 .venv/
+
+# Секреты. Репозиторий публичный, а серверный .env лежит вне его (см. FORK.md) —
+# но локальную копию легко создать из docker/.env.server.example, и один
+# `git add -A` опубликовал бы разом developer token, client secret, ключ подписи
+# и ключ service account Реестра. Шаблон остаётся в репозитории намеренно.
+.env
+.env.*
+!.env.server.example
+# JSON-ключ service account, как его отдаёт Google Cloud.
+*service-account*.json
+*-key.json
