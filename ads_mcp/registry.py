@@ -41,6 +41,7 @@ this module only fetches and parses.
 
 import base64
 import binascii
+import importlib
 import json
 import logging
 import os
@@ -190,6 +191,26 @@ class RegistrySnapshot:
         return [c for c in self.clients if wanted in _fold(c.name)]
 
 
+def _require(module: str, purpose: str) -> Any:
+    """Imports a module the Registry needs, or says plainly what is missing.
+
+    These are declared dependencies, so a failure here means the build is
+    wrong, not the configuration. It happened once: the image resolved without
+    httpx and the tool died with a bare `ModuleNotFoundError` in front of a
+    Manager, who could do nothing with it. Whoever sees this should be told
+    which module and that it is the server's problem, not theirs.
+    """
+    try:
+        return importlib.import_module(module)
+    except ImportError as error:
+        raise RegistryUnavailable(
+            f"The Registry cannot be read: this deployment is missing the "
+            f"{module} package, which {purpose}. That is a broken build rather "
+            f"than a misconfiguration — report it to whoever administers the "
+            f"server."
+        ) from error
+
+
 def _fold(value: str) -> str:
     """Reduces a label to what survives being typed by a different person.
 
@@ -242,7 +263,9 @@ def _credentials() -> Any:
     Nothing here reaches the logs. Every failure names the variable and the
     shape expected of it, never the value.
     """
-    from google.oauth2 import service_account
+    service_account = _require(
+        "google.oauth2.service_account", "signs the service account's token"
+    )
 
     raw = os.environ.get(SERVICE_ACCOUNT_KEY_ENV_VAR, "").strip()
     if not raw:
@@ -284,10 +307,13 @@ def _access_token(credentials: Any) -> str:
     `google.auth.transport.requests` arrives with google-ads, so this costs no
     dependency of its own.
     """
-    import google.auth.transport.requests
+    transport = _require(
+        "google.auth.transport.requests",
+        "exchanges the service account key for an access token",
+    )
 
     try:
-        credentials.refresh(google.auth.transport.requests.Request())
+        credentials.refresh(transport.Request())
     except Exception as error:  # google.auth raises a family of these
         raise RegistryUnavailable(
             f"The service account could not obtain a token: {error}"
@@ -308,7 +334,7 @@ def fetch() -> RegistrySnapshot:
     failure: an empty Registry is an empty allowlist, and that would lock every
     Manager out of every Account over a network blip.
     """
-    import httpx
+    httpx = _require("httpx", "makes the request to the Sheets API")
 
     sheet_id = os.environ.get(SHEET_ID_ENV_VAR, "").strip()
     if not sheet_id:
