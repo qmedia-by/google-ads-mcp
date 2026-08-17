@@ -474,6 +474,38 @@ class TestSnapshotSerialisation(unittest.TestCase):
                     registry.snapshot_from_json(raw)
 
 
+class TestMissingDependency(unittest.TestCase):
+    """A package absent from the image must not reach a Manager raw.
+
+    It did once: the first deploy of the Registry resolved without httpx, and
+    `ModuleNotFoundError: No module named 'httpx'` went straight to the person
+    asking for a list of Clients, who could do nothing about it.
+    """
+
+    def test_a_missing_package_is_the_server_s_fault_and_says_so(self):
+        with patch("importlib.import_module", side_effect=ImportError("no")):
+            with self.assertRaises(RegistryUnavailable) as context:
+                registry._require("httpx", "makes the request")
+
+        message = str(context.exception)
+        self.assertIn("httpx", message)
+        self.assertIn("administers", message)
+
+    def test_fetch_turns_it_into_an_ordinary_unavailable_registry(self):
+        # Which means the cache falls back to its snapshot rather than the
+        # whole call stack blowing up.
+        environment = {
+            SHEET_ID_ENV_VAR: "sheet-id",
+            SERVICE_ACCOUNT_KEY_ENV_VAR: "key",
+        }
+        with patch.dict("os.environ", environment):
+            with patch(
+                "importlib.import_module", side_effect=ImportError("no")
+            ):
+                with self.assertRaises(RegistryUnavailable):
+                    registry.fetch()
+
+
 class TestCredentials(unittest.TestCase):
     def test_a_missing_key_names_the_variable(self):
         with patch.dict("os.environ", {}, clear=True):

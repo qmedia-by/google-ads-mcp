@@ -11,7 +11,19 @@ dependencies = [
     # this extra. fastmcp pulls py-key-value-aio in without it, so a redis-backed
     # deployment fails at import time. Unpinned on purpose: the version is fastmcp's
     # to choose, we only need the extra.
-    "py-key-value-aio[redis]"
+    "py-key-value-aio[redis]",
+    # ads_mcp/registry.py imports these directly. Both do arrive on their own —
+    # httpx through mcp, google-auth through google-ads — and relying on that is
+    # what broke the first deploy of the Registry: the image resolved without
+    # httpx and the tool failed at runtime with ModuleNotFoundError, in front of
+    # a Manager. A package we import is a package we declare, whatever else
+    # happens to drag it in.
+    "httpx",
+    "google-auth",
+    # ads_mcp/registry_cache.py imports it directly. It also arrives with the
+    # extra above, but that extra is py-key-value-aio's promise about what *it*
+    # needs, not ours.
+    "redis",
 ]
 
 description = "MCP Server for Google Ads, depends on Google Ads API."
