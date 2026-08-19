@@ -30,6 +30,9 @@ from mcp.types import ToolAnnotations
 # call site says which one is meant.
 from ads_mcp import registry as account_registry
 from ads_mcp import registry_cache
+from ads_mcp.registry import (
+    DIRECT_DROPPED_MARKER as _DIRECT_DROPPED_MARKER,
+)
 from ads_mcp.registry import Client, RegistrySnapshot
 from ads_mcp.registry_cache import REFRESH_INTERVAL_SECONDS
 
@@ -49,36 +52,69 @@ _UNAVAILABLE = (
 )
 
 _DIRECT_IN_LISTING = (
-    "Clients who run only Yandex Direct are absent from this listing by "
-    "design — the Registry covers Google Ads and VK, see `find_client`. This "
-    "is not the agency's full list of Clients, so do not offer it as one. A "
-    "Direct Account is found through LidFly's `get_provider_context` with "
-    'provider "yandex", not here.'
+    "A Client shows `yandex_direct` here only where the sheet records the "
+    "Direct login on its own in the Direct column. Where it is written with a "
+    "password beside it the cell is not read at all, and that Client appears "
+    "without `yandex_direct` despite having a Direct Account. Its absence is "
+    "therefore never evidence: a Direct Account is confirmed or ruled out "
+    'through LidFly\'s `get_provider_context` with provider "yandex", not '
+    "here. Meta and TikTok are not in the Registry at all, so a Client who "
+    "runs only those is missing from this listing entirely — do not offer it "
+    "as the agency's full list of Clients."
+)
+
+_DIRECT_FOUND = (
+    "The Registry has a Direct login for this Client, under `yandex_direct` "
+    "in `accounts`. It is a candidate, not a resolved scope: the Registry is "
+    "a spreadsheet, and a login read out of one has not been checked against "
+    "anything. Pass it to LidFly's `get_provider_context` as `client_login` "
+    'with provider "yandex" and work from what that returns. If LidFly does '
+    "not know the login, say so plainly — do not go hunting for a similar one."
 )
 
 
-def _direct_note(name: str) -> str:
-    """Says where Yandex Direct is, in the answer rather than in a docstring.
+def _direct_note(name: str, found: bool, dropped: bool) -> str:
+    """Says where Yandex Direct stands, in the answer rather than a docstring.
 
-    The docstring above carries the same fact, but it is read before the call
-    and competes with everything else in the tool list; this is read after it,
-    as the answer to the question actually asked. That gap is the whole bug
-    this exists for: an agent that had just been handed a Client with a Google
-    Ads id and no Direct one had nothing in front of it saying where Direct
-    lives, and either wandered around LidFly guessing arguments or told the
-    Manager the Client has no Direct Account.
+    The docstring carries the same facts, but it is read before the call and
+    competes with everything else in the tool list; this is read after it, as
+    the answer to the question actually asked. That gap is the bug this exists
+    for: an agent handed a Client with a Google Ads id and no Direct one had
+    nothing in front of it saying where Direct lives, and either wandered
+    around LidFly guessing arguments or told the Manager the Client has no
+    Direct Account.
 
-    It goes at the top level rather than into `accounts`, because an empty
-    list under `yandex_direct` would read as "this Client has no Direct
-    Account" — which is exactly the false statement being prevented.
+    Three states, not two, and conflating any pair of them gives the Manager a
+    wrong answer. **Found** is a candidate login to go and resolve. **Dropped**
+    means the sheet has something here that could not be published safely — the
+    Client almost certainly does run Direct, and somebody should go and tidy
+    the cell. **Absent** means the Registry says nothing at all, which is still
+    not evidence: the Client may be missing from the Direct column entirely.
+
+    Only the first of those puts anything in `accounts`. The other two live up
+    here at the top level, because an empty list under `yandex_direct` would
+    read as "this Client has no Direct Account" — the exact false statement
+    being prevented.
     """
+    if found:
+        return _DIRECT_FOUND
+    if dropped:
+        return (
+            "The Registry holds something for this Client under Yandex Direct "
+            "that could not be published — see `problems`. Read that as "
+            "unknown rather than absent: a cell is usually dropped because it "
+            "has the password written into it, which means the Account exists. "
+            "Find it through LidFly's `get_provider_context` with provider "
+            f'"yandex" and query {name!r}, and tell the Manager the Registry '
+            "cell needs cleaning up."
+        )
     return (
-        "Not in the Registry, by design: the Registry covers Google Ads and "
-        "VK only. This answer is therefore no evidence either way about "
-        "Direct — never report a Direct Account as missing on the strength "
-        "of it. If Direct is what was asked about, that Account and its "
-        "context live in LidFly: call `get_provider_context` there with "
-        f'provider "yandex" and query {name!r}.'
+        "The Registry has no Yandex Direct login for this Client. That is no "
+        "evidence either way — never report a Direct Account as missing on "
+        "the strength of it, since the Registry covers Direct only where the "
+        "sheet happens to record the login cleanly. If Direct is what was "
+        "asked about, call LidFly's `get_provider_context` with provider "
+        f'"yandex" and query {name!r}.'
     )
 
 
@@ -177,7 +213,7 @@ def find_client(name: str) -> Dict[str, Any]:
     much it looks like the right one.
 
     Matching ignores case, spacing and punctuation, so a Client recorded as
-    `activecloud.by` is found by "activecloud". If several Clients match, all
+    `example-shop.by` is found by "example-shop". If several Clients match, all
     of them are returned and you must ask which one is meant rather than
     choosing. If none match, the Client is not in the Registry: say so and ask
     a Manager to add them.
@@ -187,11 +223,13 @@ def find_client(name: str) -> Dict[str, Any]:
     country or product line — and you must ask which is meant. Never query all
     of them and add the numbers up.
 
-    Only Google Ads and VK are in the Registry. For Yandex Direct, use the
-    LidFly provider tools: that account context lives there, not here. This
-    cuts both ways — a Client absent from the Registry, or present with no
-    Direct entry, may still run Direct. Neither answer is evidence about it,
-    and the returned `yandex_direct` field says so on every call.
+    Google Ads and VK ids here are ready to use. A `yandex_direct` login is
+    not: it is a candidate to hand to LidFly's `get_provider_context` as
+    `client_login`, and LidFly decides whether it is real. The Registry covers
+    Direct only where the sheet records the login cleanly, so its absence is
+    never evidence that a Client has no Direct Account — the `yandex_direct`
+    field returned on every call says which of the three cases this answer is.
+    Meta and TikTok are not in the Registry at all.
 
     Args:
         name: The Client's name, as the user said it.
@@ -216,22 +254,31 @@ def find_client(name: str) -> Dict[str, Any]:
         "clients": [_render(client) for client in matches],
     }
 
+    problems = _problems_about(snapshot, matches) if matches else []
+    direct_dropped = any(
+        _DIRECT_DROPPED_MARKER in problem for problem in problems
+    )
+    direct_found = any(
+        client.accounts.get("yandex_direct") for client in matches
+    )
+
     if not matches:
         result["found"] = False
         result["known_clients"] = [c.name for c in snapshot.clients]
         result["guidance"] = (
             f"No Client in the Registry matches {name!r}. The Registry covers "
-            f"Google Ads and VK only, so this means the Client has no Account "
-            f"with either — not that the agency does not run them. A Client "
-            f"who runs only Yandex Direct is missing from it by design. Say "
+            f"Google Ads, VK, and Yandex Direct where the sheet records the "
+            f"login cleanly — so this means no Account was found with any of "
+            f"those, not that the agency does not run the Client. Meta and "
+            f"TikTok are not in the Registry at all, and a Direct login "
+            f"written in the sheet next to its password is not either. Say "
             f"which Providers were actually checked rather than that the "
             f"Client is unknown, and ask for them to be added to the Registry "
-            f"only if Google Ads or VK is what was wanted. Do not guess an "
-            f"account id."
+            f"only if Google Ads or VK is what was wanted. Direct is still "
+            f"worth trying through LidFly. Do not guess an account id."
         )
     else:
         result["found"] = True
-        problems = _problems_about(snapshot, matches)
         if problems:
             result["problems"] = problems
 
@@ -250,7 +297,9 @@ def find_client(name: str) -> Dict[str, Any]:
                 f"numbers."
             )
 
-    result["yandex_direct"] = _direct_note(name)
+    result["yandex_direct"] = _direct_note(
+        name, found=direct_found, dropped=direct_dropped
+    )
 
     warning = _staleness(snapshot)
     if warning:
@@ -267,8 +316,10 @@ def list_clients() -> Dict[str, Any]:
     Account ids are deliberately not included — call `find_client` for the
     Client you actually need.
 
-    This is not every Client of the agency: those running only Yandex Direct
-    have no Registry row at all. Do not present it as a complete list.
+    This is not every Client of the agency, and `providers` is not everything a
+    Client runs. Meta and TikTok are outside the Registry, and a Yandex Direct
+    login the sheet records next to its password is not read, so it shows up
+    here as no Direct at all. Do not present either as a complete list.
 
     Returns:
         Every Client's name and which Providers they have an Account with, any

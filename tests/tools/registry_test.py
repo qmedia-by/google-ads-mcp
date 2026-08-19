@@ -27,6 +27,7 @@ from ads_mcp.tools.registry import find_client, list_clients
 SHOP = Client("shop.by", {"google_ads": ("1111111111",), "vk": ("42",)})
 OTHER = Client("other.by", {"vk": ("77",)})
 SPLIT = Client("split.by", {"google_ads": ("1111111111", "2222222222")})
+DIRECT = Client("direct-only.by", {"yandex_direct": ("example-shop",)})
 
 
 def snapshot(*clients, problems=(), age=0.0):
@@ -134,6 +135,33 @@ class TestFindClient(ToolTestCase):
 
         self.assertIn("no evidence", note)
 
+    def test_a_direct_login_comes_back_as_a_candidate_not_a_scope(self):
+        # A login read out of a spreadsheet has been checked against nothing.
+        # Handing it over as a resolved scope is how an agent ends up reporting
+        # on a cabinet that does not exist, or on somebody else's.
+        with self.serving(snapshot(DIRECT)):
+            result = find_client("direct-only.by")
+
+        self.assertEqual(
+            result["clients"][0]["accounts"]["yandex_direct"], ["example-shop"]
+        )
+        self.assertIn("candidate", result["yandex_direct"])
+        self.assertIn("client_login", result["yandex_direct"])
+
+    def test_a_dropped_direct_cell_reads_as_unknown_not_absent(self):
+        # The third state, and the one worth the code: the sheet has something
+        # here and it could not be published. Reporting that as "no Direct
+        # Account" is the false statement this whole field exists to prevent.
+        problems = (
+            "row 7: the Yandex Direct cell for 'shop.by' was not read — it "
+            "holds more than one word",
+        )
+        with self.serving(snapshot(SHOP, problems=problems)):
+            note = find_client("shop.by")["yandex_direct"]
+
+        self.assertIn("unknown rather than absent", note)
+        self.assertIn("get_provider_context", note)
+
     def test_a_miss_still_points_at_direct(self):
         # The case this was written for: about a third of the sheet's projects
         # run Direct only and have no Registry row, so a miss is where saying
@@ -148,7 +176,10 @@ class TestFindClient(ToolTestCase):
         with self.serving(snapshot(OTHER)):
             guidance = find_client("shop.by")["guidance"]
 
-        self.assertIn("Google Ads and VK only", guidance)
+        # A miss is a statement about the Providers actually covered, never
+        # about the agency's Clients. Meta, TikTok and a Direct login the sheet
+        # wrote next to its password are all outside it.
+        self.assertIn("Meta and TikTok are not in the Registry", guidance)
         self.assertIn("Yandex Direct", guidance)
         self.assertIn("Do not guess", guidance)
 
