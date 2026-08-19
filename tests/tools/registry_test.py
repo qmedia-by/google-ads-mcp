@@ -217,7 +217,9 @@ class TestListClients(ToolTestCase):
         # It is offered to the Manager as a list of candidates, and Clients who
         # run only Direct are not in it.
         with self.serving(snapshot(SHOP, OTHER)):
-            self.assertIn("get_provider_context", list_clients()["yandex_direct"])
+            self.assertIn(
+                "get_provider_context", list_clients()["yandex_direct"]
+            )
 
     def test_reports_every_problem_in_the_registry(self):
         with self.serving(snapshot(SHOP, problems=("row 4: bad",))):
