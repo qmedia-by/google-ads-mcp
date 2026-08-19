@@ -79,12 +79,15 @@ class TestIsConfigured(unittest.TestCase):
 class TestCredentialColumnsAreNeverRead(unittest.TestCase):
     """The Sheet holds cabinet and social passwords in plain text.
 
-    They are kept out by never naming those columns, so these are the tests
-    that matter most in this file: if they fail, secrets are on their way into
-    a snapshot, a Redis key and an agent's context.
+    Two mechanisms keep them out and these are the tests that matter most in
+    this file: if they fail, secrets are on their way into a snapshot, a Redis
+    key and an agent's context.
+
+    The block rule is here. The cell rule, which is what lets the Direct column
+    be read at all, is in `TestYandexDirectCells` below.
     """
 
-    def test_the_yandex_direct_column_does_not_reach_the_output(self):
+    def test_a_login_and_password_in_one_cell_yields_nothing(self):
         secret = "cabinet-login SuperSecret123"
         clients, problems = parse(
             ppc(["shop.by", "Иванов", secret, "123-456-7890", ""])
@@ -94,6 +97,38 @@ class TestCredentialColumnsAreNeverRead(unittest.TestCase):
         rendered = repr(clients) + repr(problems)
         self.assertNotIn("SuperSecret123", rendered)
         self.assertNotIn("cabinet-login", rendered)
+
+    def test_a_dropped_cell_is_reported_without_repeating_any_of_it(self):
+        # The problem travels further than the cell did — into the snapshot,
+        # into Redis, into the Manager's context. It carries a category and a
+        # row number, never a substring.
+        secret = "napalm-cabinet / Tr0ub4dor&3"
+        _, problems = parse(
+            ppc(["shop.by", "Иванов", secret, "123-456-7890", ""])
+        )
+
+        self.assertEqual(len(problems), 1)
+        self.assertIn("shop.by", problems[0])
+        self.assertIn("row 2", problems[0])
+        self.assertNotIn("Tr0ub4dor", problems[0])
+        self.assertNotIn("napalm", problems[0])
+
+    def test_an_access_block_naming_direct_is_still_skipped_whole(self):
+        # The rule that saves us here is that Yandex Direct is a *dependent*
+        # column: naming it does not make a block worth reading. Without that,
+        # adding the Direct alias would have opened the credentials block.
+        rows = [
+            *ppc(["shop.by", "Иванов", "", "123-456-7890", ""]),
+            [],
+            ["Проект", "ТС", "Яндекс Директ", "Доступы"],
+            ["other.by", "Петров", "somelogin", "hunter2"],
+        ]
+        clients, problems = parse(rows)
+
+        self.assertEqual([c.name for c in clients], ["shop.by"])
+        rendered = repr(clients) + repr(problems)
+        self.assertNotIn("hunter2", rendered)
+        self.assertNotIn("somelogin", rendered)
 
     def test_a_block_with_no_provider_columns_is_skipped_whole(self):
         rows = [
@@ -122,6 +157,149 @@ class TestCredentialColumnsAreNeverRead(unittest.TestCase):
         names = [c.name for c in clients]
         self.assertEqual(names, ["shop.by"])
         self.assertNotIn("Проект", names)
+
+
+class TestYandexDirectCells(unittest.TestCase):
+    """The one column where an identifier and a secret share a cell.
+
+    Every other extractor mines a cell and leaves the prose. This one refuses
+    the whole cell unless all of it is logins, because a password is not shaped
+    less like an identifier than a login is. These tests are that rule.
+    """
+
+    def direct(self, cell):
+        """Parses one PPC row with `cell` in the Direct column."""
+        clients, problems = parse(
+            ppc(["shop.by", "Иванов", cell, "123-456-7890", ""])
+        )
+        return clients[0].accounts.get("yandex_direct"), problems
+
+    def test_a_bare_login_is_published(self):
+        accounts, problems = self.direct("example-shop-by")
+        self.assertEqual(accounts, ("example-shop-by",))
+        self.assertEqual(problems, [])
+
+    def test_dots_and_digits_are_part_of_a_login(self):
+        accounts, _ = self.direct("alfa.radon2")
+        self.assertEqual(accounts, ("alfa.radon2",))
+
+    def test_a_yandex_mailbox_is_a_login(self):
+        accounts, _ = self.direct("example-shop@yandex.by")
+        self.assertEqual(accounts, ("example-shop@yandex.by",))
+
+    def test_an_address_at_any_other_domain_is_somebodys_contact(self):
+        accounts, problems = self.direct("manager@qmedia.by")
+        self.assertIsNone(accounts)
+        self.assertEqual(len(problems), 1)
+
+    def test_two_cabinets_listed_with_a_comma_both_come_back(self):
+        accounts, problems = self.direct("example-shop-by, example-shop-ru")
+        self.assertEqual(accounts, ("example-shop-by", "example-shop-ru"))
+        self.assertEqual(problems, [])
+
+    def test_one_bad_entry_costs_the_whole_cell(self):
+        # Not "take the good half": the good half is only recognisable as good
+        # by the same shape test the bad half just failed.
+        accounts, problems = self.direct("example-shop-by, Qwerty123!")
+        self.assertIsNone(accounts)
+        self.assertEqual(len(problems), 1)
+
+    def test_a_space_between_two_words_is_a_credential_pair(self):
+        for cell in (
+            "example-shop-by Qwerty123",
+            "example-shop-by / qwerty123",
+            "example-shop-by: qwerty123",
+            "example-shop-by\nqwerty123",
+        ):
+            with self.subTest(cell=cell):
+                accounts, problems = self.direct(cell)
+                self.assertIsNone(accounts)
+                self.assertEqual(len(problems), 1)
+
+    def test_a_line_break_is_not_a_list_separator(self):
+        # Deliberate, and it costs a real case: two cabinets written on two
+        # lines are refused. Alt-enter inside a cell is the commonest way of
+        # all to write a login above its password, and both halves of that are
+        # lowercase latin tokens — reading a line break as a list would publish
+        # the password as a second cabinet.
+        accounts, problems = self.direct("example-shop-by\nexample-shop-ru")
+        self.assertIsNone(accounts)
+        self.assertEqual(len(problems), 1)
+
+    def test_a_capital_letter_is_reported_rather_than_swallowed(self):
+        # Yandex does not care about case, but `Qwerty123` is the commonest
+        # password shape there is, so lower case is required and a login typed
+        # with a capital is sent back to be fixed rather than dropped quietly.
+        accounts, problems = self.direct("Example-shop")
+        self.assertIsNone(accounts)
+        self.assertIn("lower case", problems[0])
+
+    def test_a_word_naming_a_credential_drops_the_cell(self):
+        for cell in (
+            "логин example-shop",
+            "example-shop пароль",
+            "pass example-shop",
+        ):
+            with self.subTest(cell=cell):
+                accounts, _ = self.direct(cell)
+                self.assertIsNone(accounts)
+
+    def test_a_login_that_merely_starts_with_pass_is_not_a_credential(self):
+        accounts, _ = self.direct("passion-shop")
+        self.assertEqual(accounts, ("passion-shop",))
+
+    def test_dashes_meaning_none_are_not_reported(self):
+        for marker in ("-", "–", "—", ""):
+            with self.subTest(marker=marker):
+                accounts, problems = self.direct(marker)
+                self.assertIsNone(accounts)
+                self.assertEqual(problems, [])
+
+    def test_a_client_with_only_a_direct_login_reaches_the_registry(self):
+        # The point of the whole change: about 28 of the sheet's 92 rows have
+        # no Google Ads and no VK, and used to vanish entirely.
+        clients, _ = parse(
+            ppc(
+                ["shop.by", "Иванов", "", "123-456-7890", ""],
+                ["direct-only.by", "Иванов", "directonly", "", ""],
+            )
+        )
+
+        by_name = {c.name: c.accounts for c in clients}
+        self.assertEqual(
+            by_name["direct-only.by"], {"yandex_direct": ("directonly",)}
+        )
+
+    def test_a_direct_login_never_reaches_the_allowlist(self):
+        # The allowlist is Google Ads customer ids and nothing else. A login
+        # leaking into it would authorise an account nobody granted.
+        clients, _ = parse(
+            ppc(["shop.by", "Иванов", "example-shop", "123-456-7890", ""])
+        )
+        allowed = RegistrySnapshot(
+            clients=tuple(clients), problems=(), fetched_at=time.time()
+        ).allowed_customer_ids()
+
+        self.assertEqual(allowed, frozenset({"1234567890"}))
+
+
+class TestSheetLevelFaults(unittest.TestCase):
+    def test_a_registry_with_no_google_ads_anywhere_says_so(self):
+        # Reading Direct made this state survivable where it used to be fatal:
+        # a sheet whose Google Ads column was renamed now parses perfectly on
+        # its Direct logins, and the only symptom would be every Google Ads
+        # request refused for an allowlist that is empty rather than unknown.
+        clients, problems = parse(
+            [
+                ["Проект", "ТС PPC", "Яндекс Директ", "Гугл реклама", "VK"],
+                ["shop.by", "Иванов", "example-shop", "123-456-7890", ""],
+            ]
+        )
+
+        self.assertEqual(
+            clients[0].accounts, {"yandex_direct": ("example-shop",)}
+        )
+        self.assertTrue(any("no Google Ads Account" in p for p in problems))
 
 
 class TestBlocks(unittest.TestCase):
@@ -286,8 +464,11 @@ class TestGoogleAdsCells(unittest.TestCase):
     def test_dashes_meaning_none_are_not_reported_as_broken(self):
         for marker in ("-", "–", "—", "\\-", ""):
             with self.subTest(marker=marker):
+                # The second row only keeps the sheet-level "no Google Ads
+                # anywhere" alarm quiet; this test is about the first one.
                 rows = ppc(
                     ["shop.by", "И", "", marker, "SHOP (19142062)"],
+                    ["other.by", "И", "", "111-111-1111", ""],
                 )
                 clients, problems = parse(rows)
                 self.assertEqual(problems, [])
@@ -295,7 +476,10 @@ class TestGoogleAdsCells(unittest.TestCase):
 
     def test_a_filled_cell_with_nothing_id_shaped_is_reported(self):
         clients, problems = parse(
-            ppc(["shop.by", "И", "", "уточняется у клиента", "SHOP (1914)"])
+            ppc(
+                ["shop.by", "И", "", "уточняется у клиента", "SHOP (1914)"],
+                ["other.by", "И", "", "111-111-1111", ""],
+            )
         )
         self.assertEqual(len(problems), 1)
         self.assertIn("no google_ads id", problems[0])
@@ -423,11 +607,11 @@ class TestSnapshot(unittest.TestCase):
 
     def test_find_falls_back_to_containment(self):
         snapshot = self.snapshot(
-            Client("activecloud.by", {"vk": ("1",)}),
+            Client("example-shop.by", {"vk": ("1",)}),
             Client("other.by", {"vk": ("2",)}),
         )
         self.assertEqual(
-            [c.name for c in snapshot.find("activecloud")], ["activecloud.by"]
+            [c.name for c in snapshot.find("example-shop")], ["example-shop.by"]
         )
 
     def test_find_ignores_spacing_and_punctuation(self):
@@ -537,11 +721,19 @@ class TestCredentials(unittest.TestCase):
         self.assertNotIn(secret, str(context.exception))
 
 
-class TestFetch(unittest.TestCase):
+class FetchTestCase(unittest.TestCase):
     def setUp(self):
+        # `GOOGLE_ADS_REGISTRY_TABS` is blanked rather than left alone: a
+        # developer with it set in their shell would otherwise send the
+        # single-tab tests down the multi-tab path and read the failures as a
+        # bug in the code.
         self.env = patch.dict(
             "os.environ",
-            {SHEET_ID_ENV_VAR: "sheet-id", SERVICE_ACCOUNT_KEY_ENV_VAR: "k"},
+            {
+                SHEET_ID_ENV_VAR: "sheet-id",
+                SERVICE_ACCOUNT_KEY_ENV_VAR: "k",
+                registry.TABS_ENV_VAR: "",
+            },
         )
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -564,6 +756,8 @@ class TestFetch(unittest.TestCase):
         response.json.return_value = payload or {}
         return patch("httpx.get", return_value=response)
 
+
+class TestFetch(FetchTestCase):
     def test_a_missing_sheet_id_names_the_variable(self):
         with patch.dict("os.environ", {SHEET_ID_ENV_VAR: ""}):
             with self.assertRaises(RegistryUnavailable) as context:
@@ -619,6 +813,112 @@ class TestFetch(unittest.TestCase):
         with self.respond(payload={}):
             with self.assertRaises(RegistryUnavailable):
                 registry.fetch()
+
+
+class TestFetchTabs(FetchTestCase):
+    """Reading several named tabs rather than whichever one is first.
+
+    The file the agency keeps has five: two hold current Clients, one holds
+    Clients who have left, one is credentials and one is empty. Reading the
+    first tab alone was hiding 43 of 67 Clients; reading all of them would put
+    former Clients back in the allowlist. Hence a list, and hence the reporting
+    when the list and the file disagree.
+    """
+
+    def responses(self, titles, values, status_code=200):
+        """Answers the tab listing, then the batched values read."""
+        listing = MagicMock()
+        listing.status_code = 200
+        listing.json.return_value = {
+            "sheets": [{"properties": {"title": t}} for t in titles]
+        }
+        batch = MagicMock()
+        batch.status_code = status_code
+        batch.json.return_value = {
+            "valueRanges": [{"values": rows} for rows in values]
+        }
+        return patch("httpx.get", side_effect=[listing, batch])
+
+    def configured(self, *tabs):
+        return patch.dict("os.environ", {registry.TABS_ENV_VAR: ",".join(tabs)})
+
+    def test_merges_one_client_across_two_tabs(self):
+        # The agency keeps `Таргет + контекст` for Clients who run both and
+        # `Контекст` for those who run only that. A Client who moves between
+        # them must stay one Client, not become two.
+        first = ppc(["shop.by", "И", "", "123-456-7890", ""])
+        second = ppc(["shop.by", "И", "example-shop", "", ""])
+
+        with self.configured("A", "B"):
+            with self.responses(["A", "B"], [first, second]):
+                snapshot = registry.fetch()
+
+        self.assertEqual(len(snapshot.clients), 1)
+        self.assertEqual(
+            snapshot.clients[0].accounts,
+            {"google_ads": ("1234567890",), "yandex_direct": ("example-shop",)},
+        )
+
+    def test_a_problem_says_which_tab_the_row_is_on(self):
+        # "row 2" is useless across five tabs; the Manager has to find it.
+        rows = ppc(["shop.by", "И", "login pass", "123-456-7890", ""])
+
+        with self.configured("Контекст"):
+            with self.responses(["Контекст"], [rows]):
+                snapshot = registry.fetch()
+
+        self.assertTrue(
+            any("'Контекст'" in p for p in snapshot.problems), snapshot.problems
+        )
+
+    def test_a_tab_the_file_no_longer_has_is_reported(self):
+        rows = ppc(["shop.by", "И", "", "123-456-7890", ""])
+
+        with self.configured("Контекст", "Ушедшие"):
+            with self.responses(["Контекст"], [rows]):
+                snapshot = registry.fetch()
+
+        self.assertTrue(any("'Ушедшие'" in p for p in snapshot.problems))
+
+    def test_a_tab_nobody_configured_is_reported_too(self):
+        # The one weakness of an allowlist is that a new tab is invisible.
+        # Saying so out loud is what makes the loss recoverable.
+        rows = ppc(["shop.by", "И", "", "123-456-7890", ""])
+
+        with self.configured("Контекст"):
+            with self.responses(["Контекст", "Новая"], [rows]):
+                snapshot = registry.fetch()
+
+        self.assertTrue(any("'Новая'" in p for p in snapshot.problems))
+
+    def test_a_tab_of_former_clients_is_never_read(self):
+        # The whole reason this is an allowlist and not a denylist.
+        current = ppc(["shop.by", "И", "", "123-456-7890", ""])
+
+        with self.configured("Контекст"):
+            with self.responses(["Контекст", "покинувшие нас"], [current]):
+                snapshot = registry.fetch()
+
+        self.assertEqual([c.name for c in snapshot.clients], ["shop.by"])
+
+    def test_every_configured_tab_gone_is_unavailable_not_empty(self):
+        with self.configured("Контекст"):
+            with self.responses(["Что-то другое"], []):
+                with self.assertRaises(RegistryUnavailable) as context:
+                    registry.fetch()
+
+        self.assertIn(registry.TABS_ENV_VAR, str(context.exception))
+
+    def test_the_tabs_are_read_in_one_batched_request(self):
+        rows = ppc(["shop.by", "И", "", "123-456-7890", ""])
+
+        with self.configured("A", "B"):
+            with self.responses(["A", "B"], [rows, []]) as mock_get:
+                registry.fetch()
+
+        self.assertEqual(mock_get.call_count, 2)  # the listing, then the values
+        ranges = mock_get.call_args.kwargs["params"]["ranges"]
+        self.assertEqual(ranges, ["'A'!A1:Z2000", "'B'!A1:Z2000"])
 
 
 if __name__ == "__main__":

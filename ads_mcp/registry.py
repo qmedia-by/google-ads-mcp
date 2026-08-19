@@ -27,13 +27,23 @@ human login, so the access is granted to this deployment alone and is revoked
 by removing one viewer from the file. Nothing here writes back — the Sheet is
 edited by people.
 
-**Only two columns are ever read: Google Ads and VK.** The Sheet is a working
-document of the agency and its other columns hold credentials in plain text —
-cabinet logins next to their passwords, social accounts next to theirs. Those
-must not reach a snapshot, a cache or an agent's context, and the cheapest way
-to guarantee that is to never parse the columns they live in. Yandex Direct is
-therefore absent from the Registry by design, not by omission: the agent
-reaches Direct through LidFly, which carries its own account context.
+**The Sheet keeps credentials in plain text**, and none of them may reach a
+snapshot, a Redis key or an agent's context. Two different rules hold them
+back, and the two are not interchangeable.
+
+*Primary* columns — Google Ads and VK — are read wherever they appear, and a
+block naming neither is skipped whole. That is what keeps the access block,
+where every cell is a social password, from being parsed at all.
+
+*Dependent* columns — today only Yandex Direct — are read solely inside a block
+that already named a primary Provider, and then cell by cell under the
+all-or-nothing rule in `_extract_yandex_direct`. That column is the one place
+the Sheet writes an identifier and a secret into the same cell: for some
+projects it holds the cabinet login with its password beside it. A cell that is
+not one bare login is therefore dropped whole rather than mined for the login
+inside it, and the row is reported instead. Mining it would publish the
+password as readily as the login, because neither is shaped more like an
+identifier than the other.
 
 Caching and the fallback to a stale copy live in `ads_mcp.registry_cache`;
 this module only fetches and parses.
@@ -56,6 +66,19 @@ SHEET_ID_ENV_VAR = "GOOGLE_ADS_REGISTRY_SHEET_ID"
 SERVICE_ACCOUNT_KEY_ENV_VAR = "GOOGLE_ADS_REGISTRY_SA_KEY"
 RANGE_ENV_VAR = "GOOGLE_ADS_REGISTRY_RANGE"
 
+# Which tabs of the file hold the Registry, comma-separated and named exactly
+# as the tabs are named. An allowlist rather than a denylist, and deliberately:
+# the file also carries a tab of Clients who have left, and reading that one
+# would put their Accounts back in the allowlist and their names back in
+# `find_client`. A denylist would let a tab renamed tomorrow do exactly that.
+#
+# The cost of an allowlist is that a genuinely new tab is invisible, which
+# would be the same silent loss in the other direction — so `fetch` compares
+# this list against the tabs the file actually has and reports both
+# directions as problems. Unset means the first tab, which is upstream's
+# behaviour and keeps the image runnable against any sheet.
+TABS_ENV_VAR = "GOOGLE_ADS_REGISTRY_TABS"
+
 # Wide enough for a hand-kept sheet to grow into without an edit here, and
 # bounded so a stray value in column ZZ cannot turn one read into a large one.
 DEFAULT_RANGE = "A1:Z2000"
@@ -66,11 +89,19 @@ _SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
 _VALUES_ENDPOINT = (
     "https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{range}"
 )
+_BATCH_VALUES_ENDPOINT = (
+    "https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values:batchGet"
+)
+_METADATA_ENDPOINT = "https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
 _TIMEOUT_SECONDS = 20.0
 
-# Provider keys, in the vocabulary the agent's repository already uses. Yandex
-# Direct is deliberately not among them — see the module docstring.
-PROVIDERS: Tuple[str, ...] = ("google_ads", "vk")
+# Provider keys, in the vocabulary the agent's repository already uses.
+PROVIDERS: Tuple[str, ...] = ("google_ads", "vk", "yandex_direct")
+
+# The Providers whose presence makes a block worth reading at all. A block that
+# names only dependent columns is not a Provider block — in this Sheet that
+# shape is the access block — and `_read_header` drops its columns whole.
+PRIMARY_PROVIDERS: Tuple[str, ...] = ("google_ads", "vk")
 
 # Which column means what. Matched case-, space- and punctuation-insensitively,
 # so "VK реклама", "vk_реклама" and "ВК Реклама" are one thing. The first entry
@@ -101,6 +132,22 @@ _PROVIDER_ALIASES: Mapping[str, Tuple[str, ...]] = {
         "vk",
         "вк",
     ),
+    # The heading the Sheet uses today is the dirty one: for some rows that
+    # same column holds a password. The clean names are listed beside it so the
+    # agency can move logins into a column of their own without a code change
+    # here. The extractor is equally strict either way, so which column a value
+    # arrived in never decides whether it is published.
+    "yandex_direct": (
+        "яндекс директ",
+        "яндексдирект",
+        "yandex direct",
+        "yandexdirect",
+        "директ",
+        "direct",
+        "логин директ",
+        "логин яндекс директ",
+        "direct login",
+    ),
 }
 
 # A Google Ads id as people write it: `123-456-7890` in the interface,
@@ -108,10 +155,57 @@ _PROVIDER_ALIASES: Mapping[str, Tuple[str, ...]] = {
 # stretch out of a longer number — a phone number, a GA property id.
 _CUSTOMER_ID = re.compile(r"(?<![\d-])(?:\d{3}-\d{3}-\d{4}|\d{10})(?![\d-])")
 
+# A Yandex login as Yandex itself allows one: latin letters and digits, with
+# hyphens and dots between them, three to thirty characters, never two
+# separators running and never one at either end. Anchored, because this is
+# asked of a whole cell rather than searched for inside one.
+#
+# Lower case is required rather than folded away, and that is the load-bearing
+# part. Logins are case-insensitive at Yandex and are written in lower case;
+# passwords overwhelmingly are not, and `Qwerty123` is the shape this rules
+# out. A login typed with a capital is not silently dropped — it is reported,
+# and fixing it is one edit in the Sheet.
+_YANDEX_LOGIN = re.compile(r"^[a-z0-9](?:[.-]?[a-z0-9]){2,29}$")
+
+# The same login written as the mailbox it is. Yandex's own domains only: an
+# address at any other is somebody's contact, not a Direct account.
+_YANDEX_MAIL = re.compile(
+    r"^[a-z0-9](?:[.-]?[a-z0-9]){2,29}"
+    r"@(?:ya\.ru|yandex\.(?:ru|by|com|kz|ua|com\.tr))$"
+)
+
+# What separates two *entries* in one cell, as against what separates a login
+# from the password written after it. A comma or a semicolon is how people list
+# two cabinets; a space, a slash or a colon is how they write a credential
+# pair. Splitting on the first and refusing the second is the whole of the
+# rule.
+#
+# A line break is deliberately *not* a list separator, though it looks like the
+# obvious third one. In a sheet people edit by hand, alt-enter inside a cell is
+# the commonest way of all to write a login above its password, and both halves
+# of that are lowercase latin tokens — so treating it as a list would publish
+# the password as a second cabinet. Two cabinets written on two lines are
+# refused and reported instead; that costs one edit, and the other reading
+# costs a secret.
+_DIRECT_SEPARATORS = re.compile(r"[,;]+")
+
+# Words that say a cell is about getting *into* a cabinet rather than naming
+# one. Word-bounded, so a login like `passion-shop` is not mistaken for one.
+_CREDENTIAL_MARKERS = re.compile(
+    r"\b(?:пароль|пароля|пароли|парол|пасс|пассворд|доступ|доступы|логин|"
+    r"pass|password|passwd|pwd|login)\b",
+    re.IGNORECASE,
+)
+
 # VK cells are written as a human name followed by the id in brackets:
 # `SOME-NAME (12345678)` or `SOME-NAME (ID 12345678)`. Only the bracketed
 # number is taken; whatever else the cell holds stays where it is.
 _VK_ID = re.compile(r"\(\s*(?:ID\s*)?(\d{4,})\s*\)", re.IGNORECASE)
+
+# The words a dropped-Direct-cell problem is recognised by. `ads_mcp.tools.
+# registry` keys its "unknown, not absent" answer off this, so it lives here
+# next to the message that carries it rather than being retyped over there.
+DIRECT_DROPPED_MARKER = "Yandex Direct cell"
 
 # What people write in a cell to mean "none". Reporting these as malformed
 # would bury the real problems under dozens of deliberate blanks.
@@ -217,7 +311,7 @@ def _fold(value: str) -> str:
     Case, spacing and punctuation all vary between the Sheet and whatever the
     Manager says to the agent; letters and digits are what actually carry the
     name. Unicode-aware, because most of these names are in Cyrillic — and it
-    is what lets `activecloud.by` be found by someone who typed `activecloud`.
+    is what lets `example-shop.by` be found by someone who typed `example-shop`.
     """
     return "".join(ch for ch in value.lower() if ch.isalnum())
 
@@ -326,31 +420,44 @@ def _access_token(credentials: Any) -> str:
     return credentials.token
 
 
-def fetch() -> RegistrySnapshot:
-    """Reads the Sheet and returns it parsed.
+def configured_tabs() -> Tuple[str, ...]:
+    """The tabs this deployment is meant to read, in the order given."""
+    raw = os.environ.get(TABS_ENV_VAR, "").strip()
+    return tuple(name.strip() for name in raw.split(",") if name.strip())
 
-    Raises `RegistryUnavailable` for anything that goes wrong, including a
-    sheet that parses to nothing useful. Never returns an empty Registry on
-    failure: an empty Registry is an empty allowlist, and that would lock every
-    Manager out of every Account over a network blip.
-    """
-    httpx = _require("httpx", "makes the request to the Sheets API")
 
+def _sheet_id() -> str:
     sheet_id = os.environ.get(SHEET_ID_ENV_VAR, "").strip()
     if not sheet_id:
         raise RegistryUnavailable(
             f"{SHEET_ID_ENV_VAR} is not set: there is no Registry to read."
         )
+    return sheet_id
 
-    cell_range = os.environ.get(RANGE_ENV_VAR, "").strip() or DEFAULT_RANGE
-    url = _VALUES_ENDPOINT.format(sheet_id=sheet_id, range=cell_range)
-    token = _access_token(_credentials())
 
+def _cell_range() -> str:
+    return os.environ.get(RANGE_ENV_VAR, "").strip() or DEFAULT_RANGE
+
+
+def _get(
+    httpx: Any,
+    url: str,
+    token: str,
+    params: Any,
+    what: str,
+    not_found_hint: str = "",
+) -> Any:
+    """One GET against the Sheets API, with the failures named as causes.
+
+    The status codes matter more than usual here because nobody is watching:
+    a 403 means somebody un-shared the file, and the Manager who sees the
+    refusal is the one who can go and ask for it back.
+    """
     try:
         response = httpx.get(
             url,
             headers={"Authorization": f"Bearer {token}"},
-            params={"majorDimension": "ROWS"},
+            params=params,
             timeout=_TIMEOUT_SECONDS,
         )
     except httpx.HTTPError as error:
@@ -366,22 +473,140 @@ def fetch() -> RegistrySnapshot:
         )
     if response.status_code == 404:
         raise RegistryUnavailable(
-            f"No sheet with id from {SHEET_ID_ENV_VAR} (HTTP 404), or the "
-            f"range {cell_range!r} names a tab that does not exist."
+            f"No sheet with id from {SHEET_ID_ENV_VAR} (HTTP 404)"
+            f"{not_found_hint}."
         )
     if response.status_code >= 400:
         raise RegistryUnavailable(
-            f"The Registry sheet returned HTTP {response.status_code}."
+            f"The Registry sheet returned HTTP {response.status_code} "
+            f"for {what}."
         )
 
     try:
-        rows = response.json().get("values") or []
+        return response.json()
     except ValueError as error:
         raise RegistryUnavailable(
             f"The Registry sheet returned a body that is not JSON: {error}"
         ) from error
 
-    clients, problems = parse(rows)
+
+def _tab_titles(httpx: Any, sheet_id: str, token: str) -> List[str]:
+    """The tabs the file actually has, in file order.
+
+    Asked for separately rather than inferred from a failed read, because the
+    interesting answers are the two mismatches: a configured tab the file no
+    longer has, and a tab the file has that nobody configured. Both are silent
+    losses of Clients otherwise, in opposite directions.
+    """
+    payload = _get(
+        httpx,
+        _METADATA_ENDPOINT.format(sheet_id=sheet_id),
+        token,
+        {"fields": "sheets.properties.title"},
+        "the list of tabs",
+    )
+    return [
+        str(sheet.get("properties", {}).get("title", ""))
+        for sheet in payload.get("sheets") or []
+    ]
+
+
+def _quote_tab(tab: str) -> str:
+    """Names a tab in A1 notation. Apostrophes in a tab name double up."""
+    escaped = tab.replace("'", "''")
+    return f"'{escaped}'!{_cell_range()}"
+
+
+def fetch() -> RegistrySnapshot:
+    """Reads the Sheet and returns it parsed.
+
+    Raises `RegistryUnavailable` for anything that goes wrong, including a
+    sheet that parses to nothing useful. Never returns an empty Registry on
+    failure: an empty Registry is an empty allowlist, and that would lock every
+    Manager out of every Account over a network blip.
+
+    With no tabs configured this reads the first one, which is upstream's
+    behaviour and what the fork did before the file grew tabs. With tabs
+    configured it reads exactly those, in one batched request, and reports the
+    tabs that do not line up either way.
+    """
+    httpx = _require("httpx", "makes the request to the Sheets API")
+
+    sheet_id = _sheet_id()
+    token = _access_token(_credentials())
+    wanted = configured_tabs()
+
+    if not wanted:
+        payload = _get(
+            httpx,
+            _VALUES_ENDPOINT.format(sheet_id=sheet_id, range=_cell_range()),
+            token,
+            {"majorDimension": "ROWS"},
+            "the first tab",
+            f", or the range {_cell_range()!r} names a tab that does not exist",
+        )
+        clients, problems = parse(payload.get("values") or [])
+        return RegistrySnapshot(
+            clients=tuple(clients),
+            problems=tuple(problems),
+            fetched_at=time.time(),
+        )
+
+    titles = _tab_titles(httpx, sheet_id, token)
+    present = [tab for tab in wanted if tab in titles]
+    missing = [tab for tab in wanted if tab not in titles]
+    unlisted = [tab for tab in titles if tab not in wanted]
+
+    if not present:
+        # Not "an empty Registry": every configured tab being gone means the
+        # file was restructured under us, and the last good snapshot is a far
+        # better answer than locking the agency out of every Account.
+        raise RegistryUnavailable(
+            f"None of the tabs named in {TABS_ENV_VAR} exist in the Registry "
+            f"file. Configured: {', '.join(repr(t) for t in wanted)}. Present: "
+            f"{', '.join(repr(t) for t in titles) or '(none)'}."
+        )
+
+    payload = _get(
+        httpx,
+        _BATCH_VALUES_ENDPOINT.format(sheet_id=sheet_id),
+        token,
+        {
+            "ranges": [_quote_tab(tab) for tab in present],
+            "majorDimension": "ROWS",
+        },
+        "the configured tabs",
+    )
+
+    values = payload.get("valueRanges") or []
+    if len(values) != len(present):
+        raise RegistryUnavailable(
+            f"The Registry sheet returned {len(values)} ranges for "
+            f"{len(present)} tabs; the answer cannot be matched to the tabs "
+            f"it came from."
+        )
+
+    clients, problems = parse_tabs(
+        [
+            (tab, value.get("values") or [])
+            for tab, value in zip(present, values)
+        ]
+    )
+
+    for tab in missing:
+        problems.append(
+            f"{TABS_ENV_VAR} names a tab {tab!r} that the file does not have — "
+            f"it was renamed or deleted, and any Client on it is missing from "
+            f"the Registry entirely."
+        )
+    for tab in unlisted:
+        problems.append(
+            f"the file has a tab {tab!r} that {TABS_ENV_VAR} does not name, so "
+            f"nothing on it is read. If it holds current Clients, it has to be "
+            f"added there; if it holds former Clients or credentials, leaving "
+            f"it out is correct."
+        )
+
     return RegistrySnapshot(
         clients=tuple(clients),
         problems=tuple(problems),
@@ -462,9 +687,83 @@ def _extract_vk(cell: str) -> List[str]:
     return found
 
 
+def _direct_parts(cell: str) -> List[str]:
+    """Splits a Direct cell into the entries someone meant to list in it."""
+    return [
+        part.strip()
+        for part in _DIRECT_SEPARATORS.split(cell)
+        if part.strip() and not _is_blank(part)
+    ]
+
+
+def _extract_yandex_direct(cell: str) -> List[str]:
+    """The logins in a Direct cell, or nothing at all if it holds anything else.
+
+    Every other extractor here mines a cell for the ids inside it and leaves
+    the prose where it lies. This one must not: the Direct column is where the
+    Sheet writes a login and its password side by side, and a password is not
+    shaped less like an identifier than a login is. Mining would publish both.
+
+    So this one is all-or-nothing per cell. The cell is split on the characters
+    people list *entries* with — comma, semicolon, line break — and every part
+    must then be a bare Yandex login on its own. One part that is not, and the
+    whole cell is dropped. A login and a password in one cell are separated by
+    a space, a slash or a colon, and none of those survive the rule.
+
+    What that leaves is a cell holding one lowercase latin token that is a
+    password with no login anywhere near it. Someone would have to have written
+    the password where the login belongs and the login nowhere, which leaves
+    the cell useless to the people who keep the Sheet as well. LidFly refuses
+    such a string against its live directory rather than acting on it. That is
+    the accepted residue, and it is the reason a login from here is a candidate
+    to be resolved rather than a scope to be used.
+    """
+    if _CREDENTIAL_MARKERS.search(cell):
+        return []
+
+    parts = _direct_parts(cell)
+    if not parts:
+        return []
+
+    found: List[str] = []
+    for part in parts:
+        if not (_YANDEX_LOGIN.match(part) or _YANDEX_MAIL.match(part)):
+            return []
+        if part not in found:
+            found.append(part)
+    return found
+
+
+def _why_direct_was_dropped(cell: str) -> str:
+    """Says what was wrong with a Direct cell without repeating any of it.
+
+    The whole point of dropping the cell is that its contents must not travel,
+    and a problem message travels further than most things here — into the
+    snapshot, into Redis, into the Manager's context. So this returns a
+    category and never a substring.
+    """
+    if _CREDENTIAL_MARKERS.search(cell):
+        return "it names a credential rather than an account"
+
+    # Order matters. A cell holding `somelogin Qwerty123!` fails both of the
+    # first two tests, and "more than one word" is the diagnosis someone can
+    # act on — it says split the cell. "Not in lower case" would send them to
+    # lowercase a password.
+    parts = _direct_parts(cell)
+    if any(re.search(r"\s", part) for part in parts):
+        return (
+            "it holds more than one word — a login with a password beside it "
+            "reads like this"
+        )
+    if any(part != part.lower() for part in parts):
+        return "the login is not written in lower case"
+    return "it is not shaped like a bare Yandex login"
+
+
 _EXTRACTORS = {
     "google_ads": _extract_google_ads,
     "vk": _extract_vk,
+    "yandex_direct": _extract_yandex_direct,
 }
 
 
@@ -497,30 +796,43 @@ def _read_header(row: Sequence[str]) -> Optional[_Columns]:
 
     if name_index < 0:
         return None
+
+    if not any(provider in providers for provider in PRIMARY_PROVIDERS):
+        # A block naming a dependent column and no primary one is not a
+        # Provider block. In this Sheet that shape belongs to the access block,
+        # where every cell is a credential, and reading a "Директ" column there
+        # would mean reading passwords out of it. Emptying `providers` rather
+        # than returning None keeps the block *boundary* — the caller still
+        # ends the previous block instead of eating this header as data.
+        providers = {}
+
     return _Columns(name=name_index, providers=providers)
 
 
-def parse(
+def _fold_rows(
     rows: Sequence[Sequence[str]],
-) -> Tuple[List[Client], List[str]]:
-    """Turns sheet rows into Clients, collecting what was wrong along the way.
+    accumulators: Dict[str, _Accumulator],
+    problems: List[str],
+    tab: str,
+) -> bool:
+    """Folds one tab's rows into `accumulators`. Says whether it had a header.
 
-    The Sheet is not one table. Several blocks sit under one another on the
-    same tab, each with its own header and its own set of Provider columns, and
-    one Client routinely appears in more than one of them — its Google Ads
-    cabinet in the block the PPC team keeps, its VK cabinet in the block the
-    targeting team keeps. Blocks are therefore read in turn and Clients merged
-    by project name.
+    Nothing here raises. Whether the Registry as a whole makes sense is a
+    question about every tab together, and it is asked once, by the caller.
 
-    Raises `RegistryUnavailable` when the sheet cannot be understood at all —
-    no header we recognise anywhere, or headers but no Client under any of
-    them. Both mean the answer is unknown, and an unknown Registry must fall
-    back to the last good snapshot rather than pass itself off as an empty one.
+    The Sheet is not one table even within a tab. Blocks can sit under one
+    another, each with its own header and its own set of Provider columns, and
+    one Client routinely appears in more than one place — its Google Ads
+    cabinet on the tab the PPC team keeps, its VK cabinet on the one the
+    targeting team keeps. Blocks and tabs alike are read in turn and Clients
+    merged by project name.
     """
-    problems: List[str] = []
-    accumulators: Dict[str, _Accumulator] = {}
     columns: Optional[_Columns] = None
     saw_header = False
+
+    def where(offset: int) -> str:
+        """Names a row the way somebody looking at the file would find it."""
+        return f"row {offset} on {tab!r}" if tab else f"row {offset}"
 
     for offset, row in enumerate(rows, start=1):
         header = _read_header(row)
@@ -546,7 +858,7 @@ def parse(
             # are not worth reporting. A row with ids but no project is.
             if any(not _is_blank(value) for value in cells.values()):
                 problems.append(
-                    f"row {offset}: Accounts listed with no project name — "
+                    f"{where(offset)}: Accounts listed with no project name — "
                     f"skipped"
                 )
             continue
@@ -565,13 +877,66 @@ def parse(
                 continue
             found = _EXTRACTORS[provider](value)
             if not found:
-                problems.append(
-                    f"row {offset}: no {provider} id could be read for "
-                    f"{name!r} — the cell is filled but holds nothing shaped "
-                    f"like an id"
-                )
+                if provider == "yandex_direct":
+                    problems.append(
+                        f"{where(offset)}: the {DIRECT_DROPPED_MARKER} for "
+                        f"{name!r} was not read — "
+                        f"{_why_direct_was_dropped(value)}. "
+                        f"Nothing from it was stored anywhere. Leave the login "
+                        f"alone in that cell, in lower case, and keep the "
+                        f"password in the access block."
+                    )
+                else:
+                    problems.append(
+                        f"{where(offset)}: no {provider} id could be read for "
+                        f"{name!r} — the cell is filled but holds nothing "
+                        f"shaped like an id"
+                    )
                 continue
             accumulator.add(provider, found)
+
+    return saw_header
+
+
+def parse(
+    rows: Sequence[Sequence[str]],
+) -> Tuple[List[Client], List[str]]:
+    """One tab's worth of rows, turned into Clients. See `parse_tabs`."""
+    return parse_tabs((("", rows),))
+
+
+def parse_tabs(
+    tabs: Sequence[Tuple[str, Sequence[Sequence[str]]]],
+) -> Tuple[List[Client], List[str]]:
+    """Turns several tabs into one Registry, collecting what was wrong.
+
+    Clients merge across tabs by project name, exactly as they merge across
+    blocks within one. That is not a nicety: the agency keeps `Таргет +
+    контекст` for Clients who run both and `Контекст` for those who run only
+    that, and a Client who moves between them would otherwise become two.
+
+    Raises `RegistryUnavailable` when the whole thing cannot be understood — no
+    header we recognise on any tab, or headers but no Client with a readable
+    Account under any of them. Both mean the answer is unknown, and an unknown
+    Registry must fall back to the last good snapshot rather than pass itself
+    off as an empty one. One unreadable tab among several is *not* that: it is
+    a problem, reported, while the rest of the Registry stands.
+    """
+    problems: List[str] = []
+    accumulators: Dict[str, _Accumulator] = {}
+    saw_header = False
+    rows: Sequence[Sequence[str]] = ()
+
+    for tab, tab_rows in tabs:
+        rows = rows or tab_rows
+        if _fold_rows(tab_rows, accumulators, problems, tab):
+            saw_header = True
+        elif tab:
+            problems.append(
+                f"the tab {tab!r} has no header row naming a project, so "
+                f"nothing on it was read. Either it is not a Registry tab, or "
+                f"its columns were renamed."
+            )
 
     if not saw_header:
         seen = ", ".join(
@@ -603,7 +968,33 @@ def parse(
         )
 
     problems.extend(_conflicting_owners(clients))
+    problems.extend(_missing_google_ads_entirely(clients))
     return clients, problems
+
+
+def _missing_google_ads_entirely(clients: Sequence[Client]) -> List[str]:
+    """Reports a Registry that parsed but yielded no Google Ads Account at all.
+
+    Before Yandex Direct was read, this state could not arise quietly: Google
+    Ads and VK were the only Providers, so a renamed Google Ads column usually
+    left no Client standing and the whole read failed loudly as unavailable.
+    Now a sheet full of Direct logins parses perfectly well with the Google Ads
+    column renamed out from under it, and the only visible symptom would be
+    every Google Ads request being refused for an allowlist that is empty
+    rather than unknown.
+
+    Fail-closed either way — `access_control` refuses on an empty allowlist —
+    but a refusal nobody can explain is the expensive kind. This says what
+    happened while there is still someone reading.
+    """
+    if any("google_ads" in client.accounts for client in clients):
+        return []
+    return [
+        "no Google Ads Account was read anywhere in the Registry, so the "
+        "allowlist it produces is empty and every Google Ads request will be "
+        "refused. This is a fault of the sheet rather than of any one row — "
+        "the usual cause is the Google Ads column having been renamed."
+    ]
 
 
 def _conflicting_owners(clients: Sequence[Client]) -> List[str]:
