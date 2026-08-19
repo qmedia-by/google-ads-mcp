@@ -48,6 +48,39 @@ _UNAVAILABLE = (
     "id, and tell them the Registry is unreachable."
 )
 
+_DIRECT_IN_LISTING = (
+    "Clients who run only Yandex Direct are absent from this listing by "
+    "design — the Registry covers Google Ads and VK, see `find_client`. This "
+    "is not the agency's full list of Clients, so do not offer it as one. A "
+    "Direct Account is found through LidFly's `get_provider_context` with "
+    'provider "yandex", not here.'
+)
+
+
+def _direct_note(name: str) -> str:
+    """Says where Yandex Direct is, in the answer rather than in a docstring.
+
+    The docstring above carries the same fact, but it is read before the call
+    and competes with everything else in the tool list; this is read after it,
+    as the answer to the question actually asked. That gap is the whole bug
+    this exists for: an agent that had just been handed a Client with a Google
+    Ads id and no Direct one had nothing in front of it saying where Direct
+    lives, and either wandered around LidFly guessing arguments or told the
+    Manager the Client has no Direct Account.
+
+    It goes at the top level rather than into `accounts`, because an empty
+    list under `yandex_direct` would read as "this Client has no Direct
+    Account" — which is exactly the false statement being prevented.
+    """
+    return (
+        "Not in the Registry, by design: the Registry covers Google Ads and "
+        "VK only. This answer is therefore no evidence either way about "
+        "Direct — never report a Direct Account as missing on the strength "
+        "of it. If Direct is what was asked about, that Account and its "
+        "context live in LidFly: call `get_provider_context` there with "
+        f'provider "yandex" and query {name!r}.'
+    )
+
 
 def _describe_age(seconds: float) -> str:
     """Puts an age in words, at the coarseness anyone actually acts on."""
@@ -155,7 +188,10 @@ def find_client(name: str) -> Dict[str, Any]:
     of them and add the numbers up.
 
     Only Google Ads and VK are in the Registry. For Yandex Direct, use the
-    LidFly provider tools: that account context lives there, not here.
+    LidFly provider tools: that account context lives there, not here. This
+    cuts both ways — a Client absent from the Registry, or present with no
+    Direct entry, may still run Direct. Neither answer is evidence about it,
+    and the returned `yandex_direct` field says so on every call.
 
     Args:
         name: The Client's name, as the user said it.
@@ -184,9 +220,14 @@ def find_client(name: str) -> Dict[str, Any]:
         result["found"] = False
         result["known_clients"] = [c.name for c in snapshot.clients]
         result["guidance"] = (
-            f"No Client in the Registry matches {name!r}. Tell the Manager "
-            f"they are not in the Registry and should be added to it. Do not "
-            f"guess an account id."
+            f"No Client in the Registry matches {name!r}. The Registry covers "
+            f"Google Ads and VK only, so this means the Client has no Account "
+            f"with either — not that the agency does not run them. A Client "
+            f"who runs only Yandex Direct is missing from it by design. Say "
+            f"which Providers were actually checked rather than that the "
+            f"Client is unknown, and ask for them to be added to the Registry "
+            f"only if Google Ads or VK is what was wanted. Do not guess an "
+            f"account id."
         )
     else:
         result["found"] = True
@@ -209,6 +250,8 @@ def find_client(name: str) -> Dict[str, Any]:
                 f"numbers."
             )
 
+    result["yandex_direct"] = _direct_note(name)
+
     warning = _staleness(snapshot)
     if warning:
         result["warning"] = warning
@@ -224,6 +267,9 @@ def list_clients() -> Dict[str, Any]:
     Account ids are deliberately not included — call `find_client` for the
     Client you actually need.
 
+    This is not every Client of the agency: those running only Yandex Direct
+    have no Registry row at all. Do not present it as a complete list.
+
     Returns:
         Every Client's name and which Providers they have an Account with, any
         problems found in the Registry, and a warning if the answer came from a
@@ -237,6 +283,7 @@ def list_clients() -> Dict[str, Any]:
             for client in snapshot.clients
         ],
         "count": len(snapshot.clients),
+        "yandex_direct": _DIRECT_IN_LISTING,
     }
 
     if snapshot.problems:

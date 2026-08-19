@@ -116,6 +116,42 @@ class TestFindClient(ToolTestCase):
         with self.serving(snapshot(SHOP)):
             self.assertNotIn("guidance", find_client("shop.by"))
 
+    def test_every_answer_says_where_yandex_direct_lives(self):
+        # The fact is in the docstring too, but a docstring is read before the
+        # call and a weak model has forgotten it by the time the answer lands.
+        # This is the field that has to survive: an agent handed a Google Ads
+        # id and nothing else had no route to Direct at all.
+        with self.serving(snapshot(SHOP)):
+            note = find_client("shop.by")["yandex_direct"]
+
+        self.assertIn("get_provider_context", note)
+        self.assertIn("yandex", note)
+        self.assertIn("shop.by", note)
+
+    def test_the_direct_note_forbids_reading_it_as_an_absence(self):
+        with self.serving(snapshot(SHOP)):
+            note = find_client("shop.by")["yandex_direct"]
+
+        self.assertIn("no evidence", note)
+
+    def test_a_miss_still_points_at_direct(self):
+        # The case this was written for: about a third of the sheet's projects
+        # run Direct only and have no Registry row, so a miss is where saying
+        # "this Client does not exist" does the most damage.
+        with self.serving(snapshot(OTHER)):
+            result = find_client("shop.by")
+
+        self.assertFalse(result["found"])
+        self.assertIn("get_provider_context", result["yandex_direct"])
+
+    def test_a_miss_does_not_claim_the_client_is_unknown(self):
+        with self.serving(snapshot(OTHER)):
+            guidance = find_client("shop.by")["guidance"]
+
+        self.assertIn("Google Ads and VK only", guidance)
+        self.assertIn("Yandex Direct", guidance)
+        self.assertIn("Do not guess", guidance)
+
     def test_problems_about_this_client_come_back_with_it(self):
         problems = (
             "row 4: no google_ads id could be read for 'shop.by'",
@@ -176,6 +212,14 @@ class TestListClients(ToolTestCase):
             {"name": "shop.by", "providers": ["google_ads", "vk"]},
         )
         self.assertNotIn("1111111111", str(result))
+
+    def test_the_listing_says_it_is_not_every_client(self):
+        # It is offered to the Manager as a list of candidates, and Clients who
+        # run only Direct are not in it.
+        with self.serving(snapshot(SHOP, OTHER)):
+            self.assertIn(
+                "get_provider_context", list_clients()["yandex_direct"]
+            )
 
     def test_reports_every_problem_in_the_registry(self):
         with self.serving(snapshot(SHOP, problems=("row 4: bad",))):
