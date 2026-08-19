@@ -1,13 +1,33 @@
 name: CI
 
+# Runs in exactly two situations, and there is no third on purpose.
+#
+# A pull request into dev is the one place this spends minutes on its own: when it is
+# opened, on every push to the branch while it stays open, and if it is reopened. Those
+# three are the default `types` for pull_request; they are written out because the point
+# of this block is that somebody chose them.
+#
+# There is deliberately **no push trigger**. There used to be one — `branches-ignore:
+# [dev]` — and it meant a branch with an open PR ran the whole matrix twice for every
+# single push: once as `push`, once as `synchronize`. Six jobs became twelve, for the
+# same commit. A branch with no PR needs no CI at all: nothing can reach dev from it
+# without opening one.
+#
+# Pushes to dev are covered by `workflow_call` instead — deployment.yml calls this as its
+# quality gate, so the suite still runs against the merge commit before anything ships.
 on:
-  # Called as the quality gate of deployment.yml. Pushes to dev are therefore excluded
-  # from the push trigger below — otherwise every push to dev would run this twice.
   workflow_call:
   pull_request:
     branches: [ dev ]
-  push:
-    branches-ignore: [ dev ]
+    types: [ opened, synchronize, reopened ]
+
+# Three commits pushed in a row used to leave three full matrices running, of which only
+# the last could still matter. Superseded PR runs are cancelled; a deploy gate never is,
+# which is what the expression guards — for a `workflow_call` run `event_name` is the
+# caller's `push`, so cancel-in-progress evaluates to false there.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
