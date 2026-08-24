@@ -28,6 +28,8 @@ SHOP = Client("shop.by", {"google_ads": ("1111111111",), "vk": ("42",)})
 OTHER = Client("other.by", {"vk": ("77",)})
 SPLIT = Client("split.by", {"google_ads": ("1111111111", "2222222222")})
 DIRECT = Client("direct-only.by", {"yandex_direct": ("example-shop",)})
+# Invented id, shaped like a real one: sixteen digits.
+META = Client("meta-only.by", {"meta": ("1000000000000001",)})
 
 
 def snapshot(*clients, problems=(), age=0.0):
@@ -162,6 +164,41 @@ class TestFindClient(ToolTestCase):
         self.assertIn("unknown rather than absent", note)
         self.assertIn("get_provider_context", note)
 
+    def test_the_meta_note_says_the_registry_is_not_a_boundary(self):
+        # The one thing this field exists to stop. For Google Ads the Registry
+        # is also the allowlist, so a missing row is a refusal and refusing is
+        # right; carrying that reflex to Meta makes the agent decline work it
+        # could have done and tell the Manager their Client has no cabinet,
+        # which this sheet is in no position to know.
+        with self.serving(snapshot(SHOP)):
+            note = find_client("shop.by")["meta"]
+
+        self.assertIn("not evidence", note)
+        self.assertIn("navigation only", note)
+        self.assertIn("never refuse", note)
+
+    def test_a_meta_id_comes_back_bare_with_the_prefix_called_out(self):
+        # `accounts` holds identifiers the way every other Provider's are held
+        # here — undecorated. Meta's own tools want `act_` in front, and the
+        # note is where that gap is closed rather than in the stored value.
+        with self.serving(snapshot(META)):
+            result = find_client("meta-only.by")
+
+        self.assertEqual(
+            result["clients"][0]["accounts"]["meta"], ["1000000000000001"]
+        )
+        self.assertIn("act_", result["meta"])
+
+    def test_a_dropped_meta_cell_reads_as_unknown_not_absent(self):
+        problems = (
+            "row 7: the Meta cell for 'shop.by' was not read — its longest "
+            "run of digits is 8 long",
+        )
+        with self.serving(snapshot(SHOP, problems=problems)):
+            note = find_client("shop.by")["meta"]
+
+        self.assertIn("unknown rather than absent", note)
+
     def test_a_miss_still_points_at_direct(self):
         # The case this was written for: about a third of the sheet's projects
         # run Direct only and have no Registry row, so a miss is where saying
@@ -177,10 +214,13 @@ class TestFindClient(ToolTestCase):
             guidance = find_client("shop.by")["guidance"]
 
         # A miss is a statement about the Providers actually covered, never
-        # about the agency's Clients. Meta, TikTok and a Direct login the sheet
-        # wrote next to its password are all outside it.
-        self.assertIn("Meta and TikTok are not in the Registry", guidance)
+        # about the agency's Clients. TikTok and a Direct login the sheet wrote
+        # next to its password are outside it; Meta is inside it now, but a
+        # miss there is not a refusal either, and the guidance has to say so or
+        # the agent stops at a Client it could have worked with.
+        self.assertIn("TikTok is not in the Registry", guidance)
         self.assertIn("Yandex Direct", guidance)
+        self.assertIn("Meta through Meta", guidance)
         self.assertIn("Do not guess", guidance)
 
     def test_problems_about_this_client_come_back_with_it(self):
@@ -251,6 +291,16 @@ class TestListClients(ToolTestCase):
             self.assertIn(
                 "get_provider_context", list_clients()["yandex_direct"]
             )
+
+    def test_the_listing_says_meta_is_navigation_not_an_allowlist(self):
+        # Same trap as in `find_client`, and worse here: a Manager reading a
+        # listing with no `meta` beside a Client is one step from being told
+        # the Client has no cabinet.
+        with self.serving(snapshot(SHOP, OTHER)):
+            note = list_clients()["meta"]
+
+        self.assertIn("not an allowlist", note)
+        self.assertIn("Business Manager", note)
 
     def test_reports_every_problem_in_the_registry(self):
         with self.serving(snapshot(SHOP, problems=("row 4: bad",))):

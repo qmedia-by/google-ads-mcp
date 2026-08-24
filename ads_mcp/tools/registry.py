@@ -33,6 +33,9 @@ from ads_mcp import registry_cache
 from ads_mcp.registry import (
     DIRECT_DROPPED_MARKER as _DIRECT_DROPPED_MARKER,
 )
+from ads_mcp.registry import (
+    META_DROPPED_MARKER as _META_DROPPED_MARKER,
+)
 from ads_mcp.registry import Client, RegistrySnapshot
 from ads_mcp.registry_cache import REFRESH_INTERVAL_SECONDS
 
@@ -58,9 +61,19 @@ _DIRECT_IN_LISTING = (
     "without `yandex_direct` despite having a Direct Account. Its absence is "
     "therefore never evidence: a Direct Account is confirmed or ruled out "
     'through LidFly\'s `get_provider_context` with provider "yandex", not '
-    "here. Meta and TikTok are not in the Registry at all, so a Client who "
-    "runs only those is missing from this listing entirely — do not offer it "
-    "as the agency's full list of Clients."
+    "here. TikTok is not in the Registry at all, so a Client who runs only "
+    "TikTok is missing from this listing entirely — do not offer it as the "
+    "agency's full list of Clients."
+)
+
+_META_IN_LISTING = (
+    "A Client shows `meta` here only where the sheet records an ad account id "
+    "in the Meta column. Its absence is not evidence of anything, and the "
+    "reason differs from every other Provider here: for Meta the Registry is "
+    "navigation, not an allowlist. The cabinets a Manager may work with are "
+    "the ones their Meta Business Manager can see, and that is decided at "
+    "Meta, not in this sheet. A cabinet nobody wrote down is workable all the "
+    "same."
 )
 
 _DIRECT_FOUND = (
@@ -115,6 +128,50 @@ def _direct_note(name: str, found: bool, dropped: bool) -> str:
         "sheet happens to record the login cleanly. If Direct is what was "
         "asked about, call LidFly's `get_provider_context` with provider "
         f'"yandex" and query {name!r}.'
+    )
+
+
+def _meta_note(name: str, found: bool, dropped: bool) -> str:
+    """Says where Meta stands, in the answer rather than a docstring.
+
+    Same mechanism as `_direct_note` and the same three states — found,
+    dropped, absent — but the conclusion drawn from the third one is the
+    opposite, and carrying the wrong one across is the failure this text exists
+    to prevent.
+
+    For Google Ads the Registry is also the allowlist: an Account missing from
+    the sheet is refused by the server, and refusing is correct. For Meta it is
+    navigation only. The cabinet lives on Meta's server, which is not ours and
+    enforces nothing of ours, and a Manager whose Business Manager can see a
+    cabinet is entitled to work with it whether or not anyone has typed it into
+    a spreadsheet. An agent that brings the Google Ads reflex here refuses work
+    it should have done, and tells the Manager their Client has no Meta
+    cabinet, which the Registry is in no position to know.
+    """
+    if found:
+        return (
+            "The Registry has a Meta ad account id for this Client, under "
+            "`meta` in `accounts`. Use it as it stands — note only that Meta's "
+            "own tools want it written as `act_` followed by those digits, "
+            "and this returns them bare."
+        )
+    if dropped:
+        return (
+            "The Registry holds something for this Client under Meta that "
+            "could not be published — see `problems`. Read that as unknown "
+            "rather than absent. Ask Meta which ad accounts it can see for "
+            f"{name!r}, let the Manager pick, and tell them the Registry cell "
+            "needs the ad account id written into it."
+        )
+    return (
+        "The Registry has no Meta ad account for this Client, and that is not "
+        "evidence there is none. Unlike Google Ads — where this same sheet is "
+        "the allowlist and an Account missing from it is refused — for Meta "
+        "the Registry is navigation only. Nothing here limits which cabinets "
+        "may be worked with; the Manager's Meta Business Manager does. If Meta "
+        "is what was asked about, list the ad accounts reachable through Meta "
+        "and ask the Manager which is meant. Never pick one yourself, and "
+        "never refuse the task for want of a Registry row."
     )
 
 
@@ -223,13 +280,18 @@ def find_client(name: str) -> Dict[str, Any]:
     country or product line — and you must ask which is meant. Never query all
     of them and add the numbers up.
 
-    Google Ads and VK ids here are ready to use. A `yandex_direct` login is
-    not: it is a candidate to hand to LidFly's `get_provider_context` as
-    `client_login`, and LidFly decides whether it is real. The Registry covers
-    Direct only where the sheet records the login cleanly, so its absence is
-    never evidence that a Client has no Direct Account — the `yandex_direct`
-    field returned on every call says which of the three cases this answer is.
-    Meta and TikTok are not in the Registry at all.
+    Google Ads, VK and Meta ids here are ready to use, with one note on Meta:
+    its own tools want `act_` in front of the digits, and this returns them
+    bare. A `yandex_direct` login is not ready — it is a candidate to hand to
+    LidFly's `get_provider_context` as `client_login`, and LidFly decides
+    whether it is real.
+
+    `yandex_direct` and `meta` each come back as a field on every call, saying
+    which of three cases that answer is, because for neither of them is absence
+    evidence. The reasons differ and both matter: the sheet covers Direct only
+    where it records the login cleanly, while for Meta the Registry is
+    navigation and not an allowlist, so a cabinet nobody wrote down is still
+    workable. TikTok is not in the Registry at all.
 
     Args:
         name: The Client's name, as the user said it.
@@ -261,21 +323,24 @@ def find_client(name: str) -> Dict[str, Any]:
     direct_found = any(
         client.accounts.get("yandex_direct") for client in matches
     )
+    meta_dropped = any(_META_DROPPED_MARKER in problem for problem in problems)
+    meta_found = any(client.accounts.get("meta") for client in matches)
 
     if not matches:
         result["found"] = False
         result["known_clients"] = [c.name for c in snapshot.clients]
         result["guidance"] = (
             f"No Client in the Registry matches {name!r}. The Registry covers "
-            f"Google Ads, VK, and Yandex Direct where the sheet records the "
-            f"login cleanly — so this means no Account was found with any of "
-            f"those, not that the agency does not run the Client. Meta and "
-            f"TikTok are not in the Registry at all, and a Direct login "
-            f"written in the sheet next to its password is not either. Say "
-            f"which Providers were actually checked rather than that the "
-            f"Client is unknown, and ask for them to be added to the Registry "
-            f"only if Google Ads or VK is what was wanted. Direct is still "
-            f"worth trying through LidFly. Do not guess an account id."
+            f"Google Ads, VK, Meta, and Yandex Direct where the sheet records "
+            f"the login cleanly — so this means no Account was found with any "
+            f"of those, not that the agency does not run the Client. TikTok is "
+            f"not in the Registry at all, and a Direct login written in the "
+            f"sheet next to its password is not either. Say which Providers "
+            f"were actually checked rather than that the Client is unknown, "
+            f"and ask for them to be added to the Registry only if Google Ads "
+            f"or VK is what was wanted. Direct is still worth trying through "
+            f"LidFly, and Meta through Meta: a missing row here stops neither "
+            f"of them. Do not guess an account id."
         )
     else:
         result["found"] = True
@@ -300,6 +365,7 @@ def find_client(name: str) -> Dict[str, Any]:
     result["yandex_direct"] = _direct_note(
         name, found=direct_found, dropped=direct_dropped
     )
+    result["meta"] = _meta_note(name, found=meta_found, dropped=meta_dropped)
 
     warning = _staleness(snapshot)
     if warning:
@@ -317,9 +383,11 @@ def list_clients() -> Dict[str, Any]:
     Client you actually need.
 
     This is not every Client of the agency, and `providers` is not everything a
-    Client runs. Meta and TikTok are outside the Registry, and a Yandex Direct
-    login the sheet records next to its password is not read, so it shows up
-    here as no Direct at all. Do not present either as a complete list.
+    Client runs. TikTok is outside the Registry entirely; a Yandex Direct login
+    the sheet records next to its password is not read, so it shows up here as
+    no Direct at all; and a Meta cabinet nobody has written down is workable
+    all the same, since for Meta the Registry is navigation rather than an
+    allowlist. Do not present this as a complete list.
 
     Returns:
         Every Client's name and which Providers they have an Account with, any
@@ -335,6 +403,7 @@ def list_clients() -> Dict[str, Any]:
         ],
         "count": len(snapshot.clients),
         "yandex_direct": _DIRECT_IN_LISTING,
+        "meta": _META_IN_LISTING,
     }
 
     if snapshot.problems:

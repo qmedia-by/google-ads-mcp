@@ -35,15 +35,29 @@ back, and the two are not interchangeable.
 block naming neither is skipped whole. That is what keeps the access block,
 where every cell is a social password, from being parsed at all.
 
-*Dependent* columns — today only Yandex Direct — are read solely inside a block
-that already named a primary Provider, and then cell by cell under the
-all-or-nothing rule in `_extract_yandex_direct`. That column is the one place
-the Sheet writes an identifier and a secret into the same cell: for some
-projects it holds the cabinet login with its password beside it. A cell that is
-not one bare login is therefore dropped whole rather than mined for the login
-inside it, and the row is reported instead. Mining it would publish the
-password as readily as the login, because neither is shaped more like an
-identifier than the other.
+*Dependent* columns — Yandex Direct and Meta — are read solely inside a block
+that already named a primary Provider. Both of them live in the targeting
+block, which qualifies because VK is there too, and neither may be promoted to
+primary: the credentials block is kept unparsed by naming no primary column at
+all, and where that block sits inside a working tab rather than on a tab of its
+own, being unparsed is the only protection it has.
+
+The two are then read in opposite ways, and the difference is not stylistic.
+The Direct column is the one place the Sheet writes an identifier and a secret
+into the same cell: for some projects it holds the cabinet login with its
+password beside it. A cell that is not one bare login is therefore dropped
+whole rather than mined for the login inside it, under the all-or-nothing rule
+in `_extract_yandex_direct`. Mining it would publish the password as readily as
+the login, because neither is shaped more like an identifier than the other.
+
+Meta has no such problem and gets the opposite treatment. `_extract_meta` takes
+the number the cell marks as an id, at whatever length, and falls back to a
+long unmarked number where the cell marks nothing — leaving the prose alone
+either way, as the Google Ads and VK extractors do. It has no notion of a list
+separator: two cabinets in one cell are two ids however somebody separated
+them, and the Direct rule, which refuses a line break as a separator because
+that is how a password gets written under a login, would drop exactly those
+cells.
 
 Caching and the fallback to a stale copy live in `ads_mcp.registry_cache`;
 this module only fetches and parses.
@@ -96,7 +110,7 @@ _METADATA_ENDPOINT = "https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
 _TIMEOUT_SECONDS = 20.0
 
 # Provider keys, in the vocabulary the agent's repository already uses.
-PROVIDERS: Tuple[str, ...] = ("google_ads", "vk", "yandex_direct")
+PROVIDERS: Tuple[str, ...] = ("google_ads", "vk", "yandex_direct", "meta")
 
 # The Providers whose presence makes a block worth reading at all. A block that
 # names only dependent columns is not a Provider block — in this Sheet that
@@ -147,6 +161,20 @@ _PROVIDER_ALIASES: Mapping[str, Tuple[str, ...]] = {
         "логин директ",
         "логин яндекс директ",
         "direct login",
+    ),
+    # Meta sits in the targeting block beside TikTok and VK. `Facebook` and
+    # `Instagram` are deliberately absent: those are the words the credentials
+    # block heads its columns with. A dependent column cannot open that block
+    # on its own, so this is a second layer rather than the load-bearing one —
+    # but it costs nothing, and a column renamed out of this list fails loudly
+    # in `scripts/audit_registry_columns.py`, which prints every heading it
+    # meets.
+    "meta": (
+        "meta",
+        "мета",
+        "meta ads",
+        "мета реклама",
+        "meta реклама",
     ),
 }
 
@@ -201,6 +229,51 @@ _CREDENTIAL_MARKERS = re.compile(
 # `SOME-NAME (12345678)` or `SOME-NAME (ID 12345678)`. Only the bracketed
 # number is taken; whatever else the cell holds stays where it is.
 _VK_ID = re.compile(r"\(\s*(?:ID\s*)?(\d{4,})\s*\)", re.IGNORECASE)
+
+# Meta ad account ids come in two situations in this column, and they need
+# different rules — one rule for both is what got this wrong the first time.
+#
+# **Marked.** All but one cell says which number is the id, in one of three
+# ways: `NAME (ID 1234…)`, `NAME` over `ID 1234…` or `ID: 1234…`, and `NAME
+# (1234…)` with brackets alone. Where the sheet says "this is an id", believe
+# it whatever its length. Meta documents no length, its ids have grown over the
+# years, and the shortest one here is nine digits — a rule that only trusted
+# long numbers dropped that cabinet and called the row broken.
+#
+# **Unmarked.** Exactly one cell writes the id with nothing to mark it, as
+# `NAME 1234…`. Here length is all there is, and it has to carry the whole
+# decision, so the floor is set high rather than tight: the unmarked numbers in
+# this column that are *not* ids run to four digits (`P7` and the like in
+# cabinet names), and the one that is runs to fifteen. Thirteen sits in that
+# gap with room on both sides. It is deliberately nowhere near the marked
+# floor: an unmarked nine- to twelve-digit number is far more likely to be a
+# phone number — the neighbouring columns are full of them — than an ad
+# account.
+#
+# Watch both floors with `scripts/audit_registry_columns.py`. Each is sound
+# only while it sits in a gap, and the histogram there is split the same way.
+_META_MIN_MARKED_DIGITS = 6
+_META_MIN_BARE_DIGITS = 13
+
+# The three markings, with no length in the pattern. The floor is applied in
+# code instead, and deliberately: a rejection has to be able to say "you marked
+# this and the floor overruled it", which a regex that already excluded the
+# number cannot. `scripts/audit_registry_columns.py` splits its histogram on
+# this for the same reason.
+_META_MARKER = re.compile(
+    r"(?:\bact_|\bID\b\s*:?\s*|\(\s*)(\d+)", re.IGNORECASE
+)
+_META_BARE = re.compile(rf"(?<!\d)\d{{{_META_MIN_BARE_DIGITS},}}(?!\d)")
+
+# Every run of digits, whatever its length. Used only to say how long the
+# longest run in a rejected cell was, which is a number about the cell rather
+# than anything out of it.
+_ANY_DIGITS = re.compile(r"(?<!\d)\d+(?!\d)")
+
+# The words a dropped-Meta-cell problem is recognised by. Same job as
+# `DIRECT_DROPPED_MARKER`: `ads_mcp.tools.registry` keys its "unknown, not
+# absent" answer off it, so it lives here beside the message that carries it.
+META_DROPPED_MARKER = "Meta cell"
 
 # The words a dropped-Direct-cell problem is recognised by. `ads_mcp.tools.
 # registry` keys its "unknown, not absent" answer off this, so it lives here
@@ -687,6 +760,82 @@ def _extract_vk(cell: str) -> List[str]:
     return found
 
 
+def _extract_meta(cell: str) -> List[str]:
+    """Every Meta ad account id in the cell, in order, without repeats.
+
+    A number the cell marks as an id is taken whatever its length; a number
+    with nothing marking it has to be long enough to be unmistakable on its
+    own. Trusting the sheet's own label first is what lets a short id through —
+    ad account ids here run from nine digits to seventeen, and no floor low
+    enough to catch the short one is safe for unmarked numbers, because the
+    phone numbers these cells sit among are nine to twelve digits themselves.
+
+    Everything else stays in the cell: cabinet names, the `P7` in a naming
+    convention, whatever somebody wrote in the margin.
+
+    Deliberately without any notion of a list separator. Two cabinets in one
+    cell are two ids whether somebody put a comma, a line break or nothing
+    between them, and `_extract_yandex_direct`'s rule — which refuses a line
+    break as a separator, correctly, because that is how a password gets
+    written under a login — would drop those cells whole.
+
+    The credential check is kept as a second layer. It is not what makes this
+    safe, but the column sits next to the social accounts and it costs a line.
+    """
+    if _CREDENTIAL_MARKERS.search(cell):
+        return []
+
+    # Kept in the order they appear, so two cabinets in one cell come back the
+    # way somebody wrote them rather than marked-first.
+    hits = [
+        (match.start(1), match.group(1))
+        for match in _META_MARKER.finditer(cell)
+        if len(match.group(1)) >= _META_MIN_MARKED_DIGITS
+    ]
+    marked = {value for _, value in hits}
+    hits.extend(
+        (match.start(), match.group())
+        for match in _META_BARE.finditer(cell)
+        if match.group() not in marked
+    )
+
+    found: List[str] = []
+    for _, value in sorted(hits):
+        if value not in found:
+            found.append(value)
+    return found
+
+
+def _why_meta_was_dropped(cell: str) -> str:
+    """Says what was wrong with a Meta cell without repeating any of it.
+
+    Same restraint as `_why_direct_was_dropped`, and for the same reason: a
+    problem message travels into the snapshot, into Redis and into an agent's
+    context. The longest run of digits is given as a *length* because that is
+    the one number that tells somebody whether the floor is wrong or the cell
+    is — and a length names no digits.
+    """
+    if _CREDENTIAL_MARKERS.search(cell):
+        return "it names a credential rather than an account"
+
+    runs = _ANY_DIGITS.findall(cell)
+    if not runs:
+        return "it holds no digits at all — a name or a link, but no id"
+
+    longest = max(len(run) for run in runs)
+    if _META_MARKER.search(cell):
+        return (
+            f"it marks a number as an id, but its longest run of digits is "
+            f"only {longest} long — under the {_META_MIN_MARKED_DIGITS} an ad "
+            f"account id has"
+        )
+    return (
+        f"nothing in it is marked as an id, and its longest run of digits is "
+        f"{longest} long — an unmarked number needs {_META_MIN_BARE_DIGITS} to "
+        f"be unmistakable. Writing `ID` in front of it fixes the row"
+    )
+
+
 def _direct_parts(cell: str) -> List[str]:
     """Splits a Direct cell into the entries someone meant to list in it."""
     return [
@@ -764,6 +913,7 @@ _EXTRACTORS = {
     "google_ads": _extract_google_ads,
     "vk": _extract_vk,
     "yandex_direct": _extract_yandex_direct,
+    "meta": _extract_meta,
 }
 
 
@@ -885,6 +1035,17 @@ def _fold_rows(
                         f"Nothing from it was stored anywhere. Leave the login "
                         f"alone in that cell, in lower case, and keep the "
                         f"password in the access block."
+                    )
+                elif provider == "meta":
+                    problems.append(
+                        f"{where(offset)}: the {META_DROPPED_MARKER} for "
+                        f"{name!r} was not read — "
+                        f"{_why_meta_was_dropped(value)}. "
+                        f"Nothing from it was stored anywhere. This is not "
+                        f"evidence the Client has no Meta cabinet: for Meta "
+                        f"the Registry is navigation and not an allowlist, so "
+                        f"ask Meta which ad accounts it can see. Writing the "
+                        f"ad account id into that cell fixes the row."
                     )
                 else:
                     problems.append(
