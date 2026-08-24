@@ -223,8 +223,7 @@ def _report_meta(
             # first time — a nine-digit id sat under a marker and the report
             # called the row broken instead of calling the floor too high.
             marked = {
-                match.group(1)
-                for match in registry._META_MARKER.finditer(cell)
+                match.group(1) for match in registry._META_MARKER.finditer(cell)
             }
             for run in registry._ANY_DIGITS.findall(cell):
                 where_ = marked_lengths if run in marked else bare_lengths
