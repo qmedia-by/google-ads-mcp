@@ -44,9 +44,18 @@ TARGET_HEADER = ["Проект", "ТС Target", "Meta", "TikTok", "VK рекла
 # The credentials block: named columns we never read.
 ACCESS_HEADER = ["Проект", "ТС", "Аккаунт", "Доступы"]
 
+# Invented, and shaped like the real thing: Meta ids on the agency's sheet run
+# fifteen to seventeen digits, against eight for VK and ten for Google Ads.
+META_ID = "1000000000000001"
+OTHER_META_ID = "20000000000000002"
+
 
 def ppc(*rows):
     return [PPC_HEADER, *rows]
+
+
+def target(*rows):
+    return [TARGET_HEADER, *rows]
 
 
 class TestNormalizeCustomerId(unittest.TestCase):
@@ -332,24 +341,73 @@ class TestBlocks(unittest.TestCase):
             *ppc(["shop.by", "Иванов", "", "123-456-7890", ""]),
             [],
             TARGET_HEADER,
-            ["shop.by", "Петрова", "META (ID 555)", "TT", "SHOP (19142062)"],
+            [
+                "shop.by",
+                "Петрова",
+                f"META (ID {META_ID})",
+                "TT",
+                "SHOP (19142062)",
+            ],
         ]
         clients, _ = parse(rows)
 
         self.assertEqual(len(clients), 1)
         self.assertEqual(
             clients[0].accounts,
-            {"google_ads": ("1234567890",), "vk": ("19142062",)},
+            {
+                "google_ads": ("1234567890",),
+                "vk": ("19142062",),
+                "meta": (META_ID,),
+            },
         )
 
-    def test_ignores_providers_that_are_not_ours(self):
-        # Meta and TikTok are in the Sheet and not connected to the agent.
+    def test_reads_meta_and_still_ignores_tiktok(self):
+        # Before Meta was read this block could yield nothing at all, and a
+        # Client the agency runs only through targeting was invisible to the
+        # Registry. TikTok stays unread: it is in the Sheet with nowhere to be
+        # reached, so its column is not parsed and does not appear.
         rows = [
             TARGET_HEADER,
-            ["shop.by", "Петрова", "META (ID 555)", "TT", ""],
+            ["shop.by", "Петрова", f"META ({META_ID})", "TT", ""],
+        ]
+        clients, _ = parse(rows)
+
+        self.assertEqual(len(clients), 1)
+        self.assertEqual(clients[0].accounts, {"meta": (META_ID,)})
+
+    def test_meta_is_not_read_in_a_block_with_no_primary_column(self):
+        # The structural guarantee, now carrying a second column. Meta is
+        # dependent, so a block naming it and no primary Provider is skipped
+        # whole — and that is the only thing keeping the credentials block
+        # unparsed where it sits inside a working tab rather than on one of
+        # its own. Promoting Meta to primary would remove it.
+        rows = [
+            ["Проект", "ТС", "Meta", "Доступы"],
+            ["shop.by", "Петрова", f"META ({META_ID})", "qwerty123"],
         ]
         with self.assertRaises(RegistryUnavailable):
             parse(rows)
+
+    def test_an_unreadable_meta_cell_is_reported_without_its_contents(self):
+        rows = [
+            TARGET_HEADER,
+            [
+                "shop.by",
+                "Петрова",
+                "SOMENAME 12345678",
+                "TT",
+                "SHOP (19142062)",
+            ],
+        ]
+        clients, problems = parse(rows)
+
+        self.assertEqual(clients[0].accounts, {"vk": ("19142062",)})
+        self.assertTrue(
+            any(registry.META_DROPPED_MARKER in p for p in problems)
+        )
+        self.assertFalse(any("SOMENAME" in p for p in problems))
+        # And it must not read as "this Client has no Meta cabinet".
+        self.assertTrue(any("not evidence" in p for p in problems))
 
     def test_a_second_block_does_not_inherit_the_first_columns(self):
         rows = [
@@ -509,6 +567,142 @@ class TestVkCells(unittest.TestCase):
         rendered = repr(clients) + repr(problems)
         self.assertNotIn("1095379146", rendered)
         self.assertNotIn("375291990147", rendered)
+
+
+class TestMetaCells(unittest.TestCase):
+    """The five ways this sheet writes a Meta id, and the way it writes two.
+
+    Every id here is invented — the repository is public — but the shapes are
+    real, and they are the reason the rule keys off length. No marker is
+    reliable when one of the five shapes has no marker at all.
+    """
+
+    def _meta(self, cell):
+        """One targeting row, with a second row beside it that reads cleanly.
+
+        `parse` refuses a sheet where nothing at all was readable, so a test
+        about one rejected cell needs an anchor row or it measures the refusal
+        instead of the rule. A Client whose every cell is rejected drops out of
+        the result entirely, so `None` here means "nothing was published".
+        """
+        clients, problems = parse(
+            target(
+                ["shop.by", "И", cell, "", ""],
+                ["anchor.by", "И", "", "", "ANCHOR (19142063)"],
+            )
+        )
+        return {c.name: c for c in clients}.get("shop.by"), problems
+
+    def test_bracketed_with_the_word_id(self):
+        client, _ = self._meta(f"IC-S-P7-name (ID {META_ID})")
+        self.assertEqual(client.accounts["meta"], (META_ID,))
+
+    def test_bracketed_without_the_word_id(self):
+        client, _ = self._meta(f"IC-S-P7-name ({META_ID})")
+        self.assertEqual(client.accounts["meta"], (META_ID,))
+
+    def test_the_marker_on_a_line_of_its_own(self):
+        client, _ = self._meta(f"Somename\nID {META_ID}")
+        self.assertEqual(client.accounts["meta"], (META_ID,))
+
+    def test_the_marker_written_with_a_colon(self):
+        client, _ = self._meta(f"SOME LTD\nID: {META_ID}")
+        self.assertEqual(client.accounts["meta"], (META_ID,))
+
+    def test_no_marker_at_all(self):
+        client, _ = self._meta(f"Somename {META_ID}")
+        self.assertEqual(client.accounts["meta"], (META_ID,))
+
+    def test_a_seventeen_digit_id(self):
+        # Four of these were on the sheet before anyone had looked at one. A
+        # rule pinned to fifteen and sixteen digits would have dropped them in
+        # silence, which is why the rule is a floor and not a set of lengths.
+        client, _ = self._meta(f"Somename (ID {OTHER_META_ID})")
+        self.assertEqual(client.accounts["meta"], (OTHER_META_ID,))
+
+    def test_two_cabinets_split_by_a_line_break(self):
+        # The cell that rules out reusing the Direct rule. That one refuses a
+        # line break as a list separator — rightly, since a password gets
+        # written under a login exactly that way — and would drop this whole
+        # cell rather than return the two cabinets in it.
+        cell = f"A-name (ID {META_ID})\nB-name (ID {OTHER_META_ID})"
+        client, _ = self._meta(cell)
+        self.assertEqual(client.accounts["meta"], (META_ID, OTHER_META_ID))
+
+    def test_the_same_id_twice_comes_back_once(self):
+        client, _ = self._meta(f"A-name ({META_ID}), see also {META_ID}")
+        self.assertEqual(client.accounts["meta"], (META_ID,))
+
+    def test_a_short_id_under_a_marker_is_still_an_id(self):
+        # The regression this rule was rewritten for. Meta documents no length
+        # and its older ad accounts have shorter ids; one nine-digit id sits on
+        # the agency's sheet under a marker. A rule that only trusted long
+        # numbers dropped that cabinet and reported the row as broken, which
+        # sent somebody to fix a cell that was already correct.
+        client, _ = self._meta("Somename (ID 123456789)")
+        self.assertEqual(client.accounts["meta"], ("123456789",))
+
+    def test_an_unmarked_number_of_the_same_length_is_not_an_id(self):
+        # And this is why the short floor cannot simply be lowered for
+        # everything: the cells around this column carry phone numbers, which
+        # are nine to twelve digits themselves. Unmarked, that length is far
+        # likelier to be a phone than an ad account.
+        client, _ = self._meta("Somename 123456789")
+        self.assertIsNone(client)
+
+    def test_a_marked_number_too_short_to_be_an_id_is_refused(self):
+        # The marked floor is only there to catch a typo, not to second-guess
+        # the sheet — but a one- or two-digit "id" is a typo.
+        client, _ = self._meta("Somename (ID 12)")
+        self.assertIsNone(client)
+
+    def test_leaves_the_short_numbers_inside_a_name_alone(self):
+        # The agency's cabinet names carry digits — `P7`, `S-2`. Those are not
+        # ids, and the prose around an id is not parsed.
+        client, _ = self._meta(f"IC-S-P7-name-2 (ID {META_ID})")
+        self.assertEqual(client.accounts["meta"], (META_ID,))
+
+    def test_a_credential_word_drops_the_cell_whole(self):
+        client, _ = self._meta(f"name {META_ID} пароль qwerty")
+        self.assertIsNone(client)
+
+
+class TestWhyMetaWasDropped(unittest.TestCase):
+    def test_names_the_credential_case(self):
+        self.assertIn(
+            "credential", registry._why_meta_was_dropped("логин: someone")
+        )
+
+    def test_names_the_case_with_no_digits(self):
+        self.assertIn(
+            "no digits",
+            registry._why_meta_was_dropped("https://example.com/page"),
+        )
+
+    def test_gives_the_longest_run_as_a_length(self):
+        # The one number that tells somebody whether the floor is wrong or the
+        # cell is. A length names no digits.
+        self.assertIn(
+            "is 8 long", registry._why_meta_was_dropped("Somename 19142062")
+        )
+
+    def test_says_when_the_cell_marked_an_id_and_the_floor_refused_it(self):
+        # The two cases need different words because they need different
+        # fixes: an unmarked number is fixed in the sheet, a marked one the
+        # floor refused is a question about the floor.
+        marked = registry._why_meta_was_dropped("Somename (ID 12)")
+        unmarked = registry._why_meta_was_dropped("Somename 19142062")
+
+        self.assertIn("marks a number as an id", marked)
+        self.assertIn("nothing in it is marked", unmarked)
+        self.assertIn("Writing `ID` in front of it", unmarked)
+
+    def test_never_repeats_anything_out_of_the_cell(self):
+        # A problem message travels into the snapshot, into Redis and into an
+        # agent's context. It carries a category, never a substring.
+        reason = registry._why_meta_was_dropped("SECRETNAME (19142062)")
+        for fragment in ("SECRETNAME", "19142062"):
+            self.assertNotIn(fragment, reason)
 
 
 class TestProblems(unittest.TestCase):
